@@ -12,6 +12,7 @@ Schemas are organized by domain model:
 Usage:
     from app.schemas.client import ClientCreate, ClientResponse
     from app.schemas.contract import ContractCreate, ContractResponse
+    from app.schemas.financial import FinancialRecordCreate, FinancialRecordResponse
 """
 
 from app.schemas.client import (
@@ -26,6 +27,12 @@ from app.schemas.contract import (
     ContractUpdate,
     ContractResponse
 )
+from app.schemas.financial import (
+    FinancialRecordBase,
+    FinancialRecordCreate,
+    FinancialRecordUpdate,
+    FinancialRecordResponse
+)
 
 __all__ = [
     # Client schemas
@@ -38,4 +45,9 @@ __all__ = [
     "ContractCreate",
     "ContractUpdate",
     "ContractResponse",
+    # Financial schemas
+    "FinancialRecordBase",
+    "FinancialRecordCreate",
+    "FinancialRecordUpdate",
+    "FinancialRecordResponse",
 ]
