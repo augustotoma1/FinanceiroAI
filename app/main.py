@@ -66,10 +66,14 @@ async def root():
     }
 
 
-# API router includes will be added here as endpoints are implemented
-# Example (to be uncommented when routers are created):
-# from app.api import conversation, clients, contracts, signatures, dashboard
-# app.include_router(conversation.router, prefix="/api/conversation", tags=["conversation"])
+# API router includes
+from app.api import conversation
+
+# Include routers with prefixes and tags
+app.include_router(conversation.router, prefix="/api/conversation", tags=["conversation"])
+
+# Additional routers to be added as they are implemented:
+# from app.api import clients, contracts, signatures, dashboard
 # app.include_router(clients.router, prefix="/api/clients", tags=["clients"])
 # app.include_router(contracts.router, prefix="/api/contracts", tags=["contracts"])
 # app.include_router(signatures.router, prefix="/api/signatures", tags=["signatures"])
