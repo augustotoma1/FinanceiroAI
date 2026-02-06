@@ -22,12 +22,11 @@ from app.config import settings
 
 # Import all models here to ensure they're registered with Base.metadata
 # This is critical for autogenerate to detect model changes
-# Add imports as models are created:
-# from app.models.client import Client
-# from app.models.contract import Contract
-# from app.models.financial_record import FinancialRecord
-# from app.models.signature import Signature
-# from app.models.integration_token import IntegrationToken
+from app.models.client import Client
+from app.models.contract import Contract
+from app.models.financial_record import FinancialRecord
+from app.models.signature import Signature
+from app.models.integration_token import IntegrationToken
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
