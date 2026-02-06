@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-financeiro-aisatec"
+version = "1.0.0"
+description = "Brazilian Financial Automation System with AI - Conversational AI assistant, Conta Azul integration, electronic signatures, and delinquency analysis"
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+license = {text = "MIT"}
+authors = [
+    {name = "SATEC", email = "contato@satec.com.br"}
+]
+keywords = [
+    "financial-automation",
+    "ai",
+    "claude",
+    "conta-azul",
+    "autentique",
+    "electronic-signature",
+    "accounting",
+    "brazil"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+    "Topic :: Office/Business :: Financial :: Accounting"
+]
+dependencies = [
+    "fastapi[standard]>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "gunicorn>=22.0.0",
+    "anthropic>=0.66.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "psycopg2-binary>=2.9.0",
+    "requests>=2.31.0",
+    "requests-oauthlib>=2.0.0",
+    "gql>=3.0.0",
+    "requests-toolbelt>=1.0.0",
+    "weasyprint>=60.0",
+    "apscheduler>=3.10.0",
+    "jinja2>=3.1.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+    "pytest-cov>=4.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/satec/agent-financeiro-aisatec"
+Documentation = "https://github.com/satec/agent-financeiro-aisatec#readme"
+Repository = "https://github.com/satec/agent-financeiro-aisatec"
+Issues = "https://github.com/satec/agent-financeiro-aisatec/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+asyncio_mode = "auto"
+addopts = "-v --strict-markers --cov=app --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "*/tests/*",
+    "*/venv/*",
+    "*/__pycache__/*"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod"
+]
