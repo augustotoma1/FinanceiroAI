@@ -20,6 +20,12 @@ from app.schemas.client import (
     ClientUpdate,
     ClientResponse
 )
+from app.schemas.contract import (
+    ContractBase,
+    ContractCreate,
+    ContractUpdate,
+    ContractResponse
+)
 
 __all__ = [
     # Client schemas
@@ -27,4 +33,9 @@ __all__ = [
     "ClientCreate",
     "ClientUpdate",
     "ClientResponse",
+    # Contract schemas
+    "ContractBase",
+    "ContractCreate",
+    "ContractUpdate",
+    "ContractResponse",
 ]
