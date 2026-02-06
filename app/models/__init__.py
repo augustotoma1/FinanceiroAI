@@ -8,16 +8,18 @@ Models:
     - Client: Customer/client data model with Brazilian tax identification
     - Contract: Service contract model with financial terms and signature tracking
     - FinancialRecord: Financial transaction records for invoices, payments, and receivables
-    - Signature: Electronic signature tracking (to be implemented)
+    - Signature: Electronic signature tracking for contract workflow
     - IntegrationToken: OAuth token storage for external services (to be implemented)
 """
 
 from app.models.client import Client
 from app.models.contract import Contract
 from app.models.financial_record import FinancialRecord
+from app.models.signature import Signature
 
 __all__ = [
     "Client",
     "Contract",
     "FinancialRecord",
+    "Signature",
 ]
