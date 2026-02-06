@@ -10,8 +10,8 @@ This module contains service clients for external API integrations:
 """
 
 # Services will be imported here as they are implemented
-# from .claude_service import ClaudeService
-# from .conta_azul_service import ContaAzulService
+from .claude_service import ClaudeService
+from .conta_azul_service import ContaAzulService
 # from .autentique_service import AutentiqueService
 # from .contract_generator import ContractGenerator
 # from .delinquency_analyzer import DelinquencyAnalyzer
