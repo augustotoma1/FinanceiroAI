@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contrato de Prestação de Serviços</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 2cm;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            font-size: 11pt;
+            line-height: 1.6;
+            color: #333;
+            margin: 0;
+            padding: 0;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #333;
+            padding-bottom: 20px;
+        }
+
+        .header h1 {
+            font-size: 18pt;
+            font-weight: bold;
+            margin: 0 0 10px 0;
+            text-transform: uppercase;
+        }
+
+        .header p {
+            margin: 5px 0;
+            font-size: 10pt;
+            color: #666;
+        }
+
+        .section {
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-size: 12pt;
+            font-weight: bold;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            color: #000;
+        }
+
+        .field-label {
+            font-weight: bold;
+            display: inline-block;
+            min-width: 150px;
+        }
+
+        .field-value {
+            display: inline;
+        }
+
+        .clause {
+            margin-bottom: 15px;
+            text-align: justify;
+        }
+
+        .clause-number {
+            font-weight: bold;
+        }
+
+        .footer {
+            margin-top: 50px;
+            text-align: center;
+            border-top: 2px solid #333;
+            padding-top: 20px;
+        }
+
+        .signature-section {
+            margin-top: 50px;
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+        }
+
+        .signature-block {
+            text-align: center;
+            margin: 20px;
+            min-width: 200px;
+        }
+
+        .signature-line {
+            border-top: 1px solid #000;
+            margin-top: 50px;
+            padding-top: 5px;
+            font-size: 10pt;
+        }
+
+        .metadata {
+            margin-top: 30px;
+            font-size: 9pt;
+            color: #999;
+            text-align: center;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+
+        table td {
+            padding: 8px;
+            vertical-align: top;
+        }
+
+        .amount {
+            font-weight: bold;
+            color: #006400;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Contrato de Prestação de Serviços</h1>
+        <p>Gerado automaticamente via Sistema de Automação Financeira</p>
+    </div>
+
+    <div class="section">
+        <div class="section-title">1. Partes Contratantes</div>
+
+        <table>
+            <tr>
+                <td>
+                    <span class="field-label">Contratante:</span>
+                    <span class="field-value">{{ client_name }}</span>
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    <span class="field-label">CPF/CNPJ:</span>
+                    <span class="field-value">{{ cpf_cnpj }}</span>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="section">
+        <div class="section-title">2. Objeto do Contrato</div>
+        <div class="clause">
+            <p>{{ service_description }}</p>
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">3. Valor e Forma de Pagamento</div>
+
+        <table>
+            <tr>
+                <td>
+                    <span class="field-label">Valor Total:</span>
+                    <span class="field-value amount">R$ {{ "%.2f"|format(contract_value) }}</span>
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    <span class="field-label">Forma de Pagamento:</span>
+                    <span class="field-value">{{ payment_terms }}</span>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="section">
+        <div class="section-title">4. Prazo e Vigência</div>
+
+        <table>
+            <tr>
+                <td>
+                    <span class="field-label">Data de Início:</span>
+                    <span class="field-value">{{ start_date }}</span>
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    <span class="field-label">Duração:</span>
+                    <span class="field-value">{{ duration_months }} meses</span>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    {% if special_clauses %}
+    <div class="section">
+        <div class="section-title">5. Cláusulas Especiais</div>
+        <div class="clause">
+            <p>{{ special_clauses }}</p>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="section">
+        <div class="section-title">{% if special_clauses %}6{% else %}5{% endif %}. Cláusulas Gerais</div>
+
+        <div class="clause">
+            <span class="clause-number">{% if special_clauses %}6.1{% else %}5.1{% endif %}.</span>
+            <strong>Confidencialidade:</strong> As partes se comprometem a manter sigilo sobre todas as informações confidenciais trocadas durante a vigência deste contrato.
+        </div>
+
+        <div class="clause">
+            <span class="clause-number">{% if special_clauses %}6.2{% else %}5.2{% endif %}.</span>
+            <strong>Rescisão:</strong> Este contrato poderá ser rescindido por qualquer das partes mediante aviso prévio de 30 (trinta) dias.
+        </div>
+
+        <div class="clause">
+            <span class="clause-number">{% if special_clauses %}6.3{% else %}5.3{% endif %}.</span>
+            <strong>Foro:</strong> Fica eleito o foro da comarca da sede do Contratante para dirimir quaisquer dúvidas oriundas deste contrato.
+        </div>
+
+        <div class="clause">
+            <span class="clause-number">{% if special_clauses %}6.4{% else %}5.4{% endif %}.</span>
+            <strong>Disposições Gerais:</strong> Este contrato não poderá ser modificado sem o consentimento expresso de ambas as partes.
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">{% if special_clauses %}7{% else %}6{% endif %}. Assinaturas</div>
+
+        <p>E, por estarem assim justas e contratadas, as partes assinam o presente contrato em duas vias de igual teor e forma, para que produza seus efeitos legais.</p>
+
+        <div class="signature-section">
+            <div class="signature-block">
+                <div class="signature-line">
+                    {{ client_name }}<br>
+                    Contratante<br>
+                    CPF/CNPJ: {{ cpf_cnpj }}
+                </div>
+            </div>
+
+            <div class="signature-block">
+                <div class="signature-line">
+                    Contratado<br>
+                    [Representante Legal]
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="metadata">
+        <p>Documento gerado em: {{ generation_date }}</p>
+        <p>ID do Contrato: {{ contract_id }}</p>
+    </div>
+</body>
+</html>
