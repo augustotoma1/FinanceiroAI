@@ -14,7 +14,9 @@ All jobs are designed to run independently and handle their own error recovery.
 """
 
 from app.background.sync_clients import sync_clients_job
+from app.background.sync_financial import sync_financial_job
 
 __all__ = [
     "sync_clients_job",
+    "sync_financial_job",
 ]
