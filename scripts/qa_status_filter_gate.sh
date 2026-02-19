@@ -6,7 +6,7 @@ set -euo pipefail
 PROJECT_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${PROJECT_DIR}"
 
-if [[ -d "venv" ]]; then
+if [[ "${QA_SKIP_LOCAL_VENV:-0}" != "1" && -x "venv/bin/python" && -f "venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
   source venv/bin/activate
 fi
