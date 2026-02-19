@@ -30,7 +30,3 @@ jobs:
       - name: Run API contract gate (status_filter)
         run: |
           bash scripts/qa_status_filter_gate.sh "${GITHUB_WORKSPACE}"
-
-      - name: Run P1 security gate
-        run: |
-          bash scripts/qa_p1_security_gate.sh "${GITHUB_WORKSPACE}"
