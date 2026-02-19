@@ -1,0 +1,39 @@
+name: API Contract Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  status-filter-gate:
+    runs-on: ubuntu-latest
+    env:
+      TEST_DATABASE_URL: sqlite:///./tmp_test_ci.db
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run API contract gate (status_filter)
+        run: |
+          source venv/bin/activate
+          bash scripts/qa_status_filter_gate.sh "${GITHUB_WORKSPACE}"
+
+      - name: Run P1 security gate
+        run: |
+          source venv/bin/activate
+          bash scripts/qa_p1_security_gate.sh "${GITHUB_WORKSPACE}"
