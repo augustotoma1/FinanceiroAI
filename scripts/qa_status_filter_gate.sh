@@ -19,5 +19,5 @@ fi
 
 echo "[QA Gate] Validando contrato status_filter..."
 python scripts/check_status_filter_contract.py
-pytest -q -o addopts='' tests/test_api/test_endpoints.py -k 'status_filter or legacy_status or guardrails or openapi_uses_status_filter'
+pytest -q -o addopts='' tests/test_api/test_status_filter_contract.py
 echo "[QA Gate] OK: contrato status_filter validado."
