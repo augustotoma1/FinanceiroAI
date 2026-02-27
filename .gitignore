@@ -1,11 +1,60 @@
-# Auto Claude data directory
+# -------------------------------------------------------------------
+# Codex / Claude
+# -------------------------------------------------------------------
 .auto-claude/
-
-# Auto Claude generated files
 .auto-claude-security.json
 .auto-claude-status
 .claude_settings.json
 .worktrees/
 .security-key
-logs/security/
+
+# -------------------------------------------------------------------
+# Secrets and local environment
+# -------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+mac-studio-vps-key
+mac-studio-vps-key.pub
+
+# -------------------------------------------------------------------
+# Python / test artifacts
+# -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# -------------------------------------------------------------------
+# OS/editor junk
+# -------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# -------------------------------------------------------------------
+# Runtime/log/temp outputs
+# -------------------------------------------------------------------
+logs/
+*.log
+tmp/
+tmp_*.db
+output/
+
+# Existing explicit path
 docs/iso9001/.DS_Store

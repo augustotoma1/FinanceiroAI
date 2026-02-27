@@ -7,25 +7,125 @@ to provide real-time KPIs for financial oversight and system monitoring.
 
 Endpoints:
 - GET /metrics - Get comprehensive dashboard metrics and KPIs
+- GET /cash-risk - Get executive cash-risk snapshot with daily history
+- GET /financial-sync-status - Get financial synchronization freshness/status
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Dict, Any
 import logging
 
 from app.database import get_db
+from app.config import settings
 from app.models.client import Client
 from app.models.contract import Contract
 from app.models.signature import Signature
 from app.models.financial_record import FinancialRecord
+from app.services.contract_lifecycle_service import build_contract_lifecycle_snapshot
+from app.services.cash_risk_service import (
+    CashRiskAuthError,
+    CashRiskError,
+    get_cash_risk_dashboard_data,
+)
+from app.services.ai_phase2_service import get_phase2_readiness_snapshot
+from app.agents.orchestrator import AIEmployeeOrchestrator
+from app.background.sync_financial import get_financial_sync_status
 
 logger = logging.getLogger(__name__)
 
 # Create router with prefix and tags
 router = APIRouter()
+
+
+def _compute_financial_sync_metrics(db: Session) -> Dict[str, Any]:
+    """Compute financial synchronization aggregates for dashboard cards."""
+    total_records = db.query(func.count(FinancialRecord.id)).scalar() or 0
+    synced_records = db.query(func.count(FinancialRecord.id)).filter(
+        FinancialRecord.conta_azul_id.isnot(None),
+        FinancialRecord.last_synced_at.isnot(None),
+    ).scalar() or 0
+    receivable_records = db.query(func.count(FinancialRecord.id)).filter(
+        FinancialRecord.transaction_type == "receivable"
+    ).scalar() or 0
+    payable_records = db.query(func.count(FinancialRecord.id)).filter(
+        FinancialRecord.transaction_type == "payable"
+    ).scalar() or 0
+    overdue_records = db.query(func.count(FinancialRecord.id)).filter(
+        FinancialRecord.status == "overdue"
+    ).scalar() or 0
+
+    last_synced = db.query(FinancialRecord).filter(
+        FinancialRecord.last_synced_at.isnot(None)
+    ).order_by(FinancialRecord.last_synced_at.desc()).first()
+    last_sync_time = last_synced.last_synced_at if last_synced else None
+
+    freshness = "unknown"
+    if not last_sync_time:
+        freshness = "missing"
+    else:
+        if last_sync_time.tzinfo is None:
+            last_sync_time = last_sync_time.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - last_sync_time).total_seconds() / 3600.0
+        if age_hours > 48:
+            freshness = "stale"
+        elif age_hours > 24:
+            freshness = "warning"
+        else:
+            freshness = "fresh"
+
+    return {
+        "total_records": total_records,
+        "synced_records": synced_records,
+        "receivable_records": receivable_records,
+        "payable_records": payable_records,
+        "overdue_records": overdue_records,
+        "last_sync_time": last_sync_time.isoformat() if last_sync_time else None,
+        "freshness": freshness,
+    }
+
+
+def _compute_client_sync_metrics(db: Session) -> Dict[str, Any]:
+    """Compute client synchronization freshness and coverage card."""
+    total_clients = db.query(func.count(Client.id)).scalar() or 0
+    synced_clients = db.query(func.count(Client.id)).filter(
+        Client.conta_azul_id.isnot(None)
+    ).scalar() or 0
+    local_only_clients = max(total_clients - synced_clients, 0)
+    coverage_pct = (synced_clients / total_clients * 100.0) if total_clients > 0 else 0.0
+
+    last_synced = db.query(Client).filter(
+        Client.last_synced_at.isnot(None)
+    ).order_by(Client.last_synced_at.desc()).first()
+    last_sync_time = last_synced.last_synced_at if last_synced else None
+
+    freshness = "missing"
+    hours_since_last_sync = None
+    if last_sync_time:
+        if last_sync_time.tzinfo is None:
+            last_sync_time = last_sync_time.replace(tzinfo=timezone.utc)
+        hours_since_last_sync = max(
+            0.0,
+            (datetime.now(timezone.utc) - last_sync_time).total_seconds() / 3600.0,
+        )
+        if hours_since_last_sync > 6:
+            freshness = "stale"
+        elif hours_since_last_sync > 2:
+            freshness = "warning"
+        else:
+            freshness = "fresh"
+
+    return {
+        "total_clients": total_clients,
+        "synced_clients": synced_clients,
+        "local_only_clients": local_only_clients,
+        "coverage_pct": round(coverage_pct, 2),
+        "last_sync_time": last_sync_time.isoformat() if last_sync_time else None,
+        "hours_since_last_sync": round(hours_since_last_sync, 2) if hours_since_last_sync is not None else None,
+        "freshness": freshness,
+    }
 
 
 @router.get("/metrics", status_code=status.HTTP_200_OK)
@@ -207,6 +307,12 @@ async def get_dashboard_metrics(db: Session = Depends(get_db)) -> Dict[str, Any]
         ]
 
         logger.debug(f"Retrieved {len(recent_contracts)} recent contracts")
+        financial_sync_metrics = _compute_financial_sync_metrics(db)
+        client_sync_metrics = _compute_client_sync_metrics(db)
+        contract_lifecycle = build_contract_lifecycle_snapshot(
+            db,
+            days_ahead=int(getattr(settings, "CONTRACT_LIFECYCLE_ALERT_DAYS", 30)),
+        )
 
         # BUILD RESPONSE
         metrics = {
@@ -230,8 +336,19 @@ async def get_dashboard_metrics(db: Session = Depends(get_db)) -> Dict[str, Any]
                 "pending_count": pending_count,
                 "pending_amount": float(pending_amount)
             },
+            "client_sync": client_sync_metrics,
+            "financial_sync": financial_sync_metrics,
+            "contract_lifecycle": {
+                "window_days": int(contract_lifecycle.get("window_days") or 30),
+                "monitored_total": int(contract_lifecycle.get("monitored_total") or 0),
+                "overdue_count": int(contract_lifecycle.get("overdue_count") or 0),
+                "expiring_soon_count": int(contract_lifecycle.get("expiring_soon_count") or 0),
+                "missing_end_date_count": int(contract_lifecycle.get("missing_end_date_count") or 0),
+                "overdue_top": list(contract_lifecycle.get("overdue") or [])[:5],
+                "expiring_soon_top": list(contract_lifecycle.get("expiring_soon") or [])[:5],
+            },
             "recent_contracts": recent_contracts,
-            "generated_at": datetime.utcnow().isoformat()
+            "generated_at": datetime.now(timezone.utc).isoformat()
         }
 
         logger.info("Dashboard metrics generated successfully")
@@ -242,4 +359,107 @@ async def get_dashboard_metrics(db: Session = Depends(get_db)) -> Dict[str, Any]
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate dashboard metrics"
+        )
+
+
+@router.get("/cash-risk", status_code=status.HTTP_200_OK)
+async def get_cash_risk(
+    refresh: bool = Query(False, description="Force live refresh from Conta Azul"),
+    history_days: int = Query(30, ge=1, le=180, description="Number of days in history"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Get executive cash-risk snapshot and daily history.
+
+    Returns the current snapshot (cached for today unless refresh=true) and
+    historical snapshots persisted in the database.
+    """
+    try:
+        return await get_cash_risk_dashboard_data(
+            db=db,
+            force_refresh=refresh,
+            history_days=history_days,
+        )
+    except CashRiskAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        )
+    except CashRiskError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute cash risk snapshot: {exc}",
+        )
+    except Exception as exc:
+        logger.error("Error generating cash risk snapshot: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate cash risk snapshot",
+        )
+
+
+@router.get("/financial-sync-status", status_code=status.HTTP_200_OK)
+async def dashboard_financial_sync_status() -> Dict[str, Any]:
+    """
+    Get financial synchronization status and freshness indicators.
+
+    Returns a compact status payload designed for executive dashboards.
+    """
+    try:
+        return await get_financial_sync_status()
+    except Exception as exc:
+        logger.error("Error generating financial sync status: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate financial sync status",
+        )
+
+
+@router.get("/ai-employee/status", status_code=status.HTTP_200_OK)
+async def ai_employee_status() -> Dict[str, Any]:
+    """
+    Get AI Employee runtime status and feature gates.
+    """
+    orchestrator = AIEmployeeOrchestrator()
+    return orchestrator.runtime_status()
+
+
+@router.post("/ai-employee/run", status_code=status.HTTP_200_OK)
+async def run_ai_employee_cycle(
+    force: bool = Query(False, description="Allow run even when AI_EMPLOYEE_ENABLED=false"),
+    engine: str | None = Query(
+        None,
+        description="Optional orchestration engine override (builtin|langgraph|crewai|auto)",
+    ),
+) -> Dict[str, Any]:
+    """
+    Execute one AI Employee orchestration cycle on demand.
+    """
+    orchestrator = AIEmployeeOrchestrator()
+    try:
+        return await orchestrator.run_daily_operations(
+            trigger="api",
+            force=force,
+            engine_override=engine,
+        )
+    except Exception as exc:
+        logger.error("Error executing AI Employee cycle: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to execute AI Employee cycle",
+        )
+
+
+@router.get("/ai-employee/phase2-readiness", status_code=status.HTTP_200_OK)
+async def ai_employee_phase2_readiness() -> Dict[str, Any]:
+    """
+    Get rollout readiness snapshot for AI phase 2 levels (validation, communication, decision).
+    """
+    try:
+        return await get_phase2_readiness_snapshot()
+    except Exception as exc:
+        logger.error("Error generating AI phase2 readiness: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate AI phase2 readiness snapshot",
         )

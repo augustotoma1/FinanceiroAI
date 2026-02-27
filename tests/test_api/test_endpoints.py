@@ -29,6 +29,7 @@ from app.models.signature import Signature
 from app.models.integration_token import IntegrationToken
 from app.models.conversation import Conversation
 from app.models.oauth_state import OAuthState
+from app.services.autentique_service import AutentiqueAPIError
 
 
 @pytest.fixture
@@ -855,6 +856,174 @@ class TestContractEndpoints:
         assert "application/pdf" in response.headers["content-type"]
         assert "content-disposition" in response.headers
         generator.generate_contract_pdf.assert_awaited_once()
+
+    def test_send_contract_for_signature_success(
+        self,
+        client,
+        db_session,
+        test_client_id,
+        sample_contract_data,
+    ):
+        """Dispatch endpoint should generate PDF, call Autentique and persist signatures."""
+        sample_contract_data["client_id"] = test_client_id
+        create_response = client.post("/api/contracts/", json=sample_contract_data)
+        contract_id = create_response.json()["id"]
+
+        with patch("app.services.contract_signature_service.ContractGenerator") as mock_generator_cls:
+            generator = Mock()
+            generator.generate_contract_pdf = AsyncMock(return_value=b"%PDF-1.4 mock")
+            mock_generator_cls.return_value = generator
+
+            with patch("app.services.contract_signature_service.AutentiqueService") as mock_autentique_cls:
+                autentique = Mock()
+                autentique.create_document = AsyncMock(
+                    return_value={
+                        "id": "doc-test-123",
+                        "signatures": [
+                            {
+                                "public_id": "sig-public-1",
+                                "name": "Assinante Teste",
+                                "email": "assinante.teste@example.com",
+                                "action": "SIGN",
+                                "link": {"short_link": "https://aut.ent/sig1"},
+                                "signed": None,
+                                "rejected": None,
+                            }
+                        ],
+                    }
+                )
+                mock_autentique_cls.return_value = autentique
+
+                response = client.post(
+                    f"/api/contracts/{contract_id}/send-for-signature",
+                    json={
+                        "template_name": "default_contract.html",
+                        "show_audit_page": True,
+                        "signers": [
+                            {
+                                "name": "Assinante Teste",
+                                "email": "assinante.teste@example.com",
+                                "cpf": "12345678901",
+                            }
+                        ],
+                    },
+                )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["contract_id"] == contract_id
+        assert data["autentique_document_id"] == "doc-test-123"
+        assert data["status"] == "pending_signature"
+        assert data["signers_created"] == 1
+        assert data["signers_updated"] == 0
+        assert len(data["signatures"]) == 1
+        assert data["signatures"][0]["autentique_signature_id"] == "sig-public-1"
+
+        contract = db_session.query(Contract).filter(Contract.id == contract_id).first()
+        assert contract is not None
+        assert contract.autentique_document_id == "doc-test-123"
+        assert contract.status == "pending_signature"
+
+        signatures = db_session.query(Signature).filter(Signature.contract_id == contract_id).all()
+        assert len(signatures) == 1
+        assert signatures[0].signer_email == "assinante.teste@example.com"
+        assert signatures[0].autentique_signature_id == "sig-public-1"
+
+    def test_send_contract_for_signature_defaults_to_client_signer(
+        self,
+        client,
+        db_session,
+        test_client_id,
+        sample_contract_data,
+    ):
+        """When signers are omitted, endpoint must use contract client as default signer."""
+        sample_contract_data["client_id"] = test_client_id
+        create_response = client.post("/api/contracts/", json=sample_contract_data)
+        contract_id = create_response.json()["id"]
+
+        with patch("app.services.contract_signature_service.ContractGenerator") as mock_generator_cls:
+            generator = Mock()
+            generator.generate_contract_pdf = AsyncMock(return_value=b"%PDF-1.4 mock")
+            mock_generator_cls.return_value = generator
+
+            with patch("app.services.contract_signature_service.AutentiqueService") as mock_autentique_cls:
+                autentique = Mock()
+                autentique.create_document = AsyncMock(
+                    return_value={"id": "doc-test-default", "signatures": []}
+                )
+                mock_autentique_cls.return_value = autentique
+
+                response = client.post(
+                    f"/api/contracts/{contract_id}/send-for-signature",
+                    json={},
+                )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["autentique_document_id"] == "doc-test-default"
+        assert data["signers_created"] == 1
+        assert len(data["signatures"]) == 1
+
+        contract = db_session.query(Contract).filter(Contract.id == contract_id).first()
+        contract_client = db_session.query(Client).filter(Client.id == contract.client_id).first()
+        created_signature = db_session.query(Signature).filter(Signature.contract_id == contract_id).first()
+        assert contract_client is not None
+        assert created_signature is not None
+        assert created_signature.signer_email == contract_client.email
+
+    def test_send_contract_for_signature_already_sent_returns_409(
+        self,
+        client,
+        test_client_id,
+        sample_contract_data,
+    ):
+        """Dispatch must reject contracts already linked to an Autentique document."""
+        sample_contract_data["client_id"] = test_client_id
+        create_response = client.post("/api/contracts/", json=sample_contract_data)
+        contract_id = create_response.json()["id"]
+
+        update_response = client.put(
+            f"/api/contracts/{contract_id}",
+            json={"autentique_document_id": "doc-existing-123"},
+        )
+        assert update_response.status_code == 200
+
+        response = client.post(
+            f"/api/contracts/{contract_id}/send-for-signature",
+            json={},
+        )
+
+        assert response.status_code == 409
+        assert "already sent" in response.json()["detail"].lower()
+
+    def test_send_contract_for_signature_provider_error_returns_503(
+        self,
+        client,
+        test_client_id,
+        sample_contract_data,
+    ):
+        """Provider failures should be surfaced as 503 for retryable integration errors."""
+        sample_contract_data["client_id"] = test_client_id
+        create_response = client.post("/api/contracts/", json=sample_contract_data)
+        contract_id = create_response.json()["id"]
+
+        with patch("app.services.contract_signature_service.ContractGenerator") as mock_generator_cls:
+            generator = Mock()
+            generator.generate_contract_pdf = AsyncMock(return_value=b"%PDF-1.4 mock")
+            mock_generator_cls.return_value = generator
+
+            with patch("app.services.contract_signature_service.AutentiqueService") as mock_autentique_cls:
+                autentique = Mock()
+                autentique.create_document = AsyncMock(side_effect=AutentiqueAPIError("provider down"))
+                mock_autentique_cls.return_value = autentique
+
+                response = client.post(
+                    f"/api/contracts/{contract_id}/send-for-signature",
+                    json={},
+                )
+
+        assert response.status_code == 503
+        assert "autentique" in response.json()["detail"].lower()
 
 
 # ============================================================================
@@ -1795,6 +1964,26 @@ class TestDashboardEndpoints:
             force=True,
             engine_override="auto",
         )
+
+    def test_get_ai_employee_phase2_readiness(self, client):
+        """Phase 2 readiness endpoint should return level status payload."""
+        payload = {
+            "generated_at": "2026-02-27T18:00:00+00:00",
+            "level_1_validation": {"status": "ready", "checks": {}},
+            "level_2_communication": {"status": "partial", "checks": {}},
+            "level_3_decision_support": {"status": "partial", "checks": {}},
+            "next_steps": ["Sair de dry-run e formalizar aprovação operacional para apoio à decisão."],
+        }
+        with patch(
+            "app.api.dashboard.get_phase2_readiness_snapshot",
+            new=AsyncMock(return_value=payload),
+        ):
+            response = client.get("/api/dashboard/ai-employee/phase2-readiness")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["level_1_validation"]["status"] == "ready"
+        assert data["level_2_communication"]["status"] == "partial"
 
 
 # ============================================================================
