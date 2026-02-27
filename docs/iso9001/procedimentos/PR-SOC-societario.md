@@ -30,17 +30,17 @@ Gerenciar abertura, alteração e encerramento de empresas dos clientes com qual
 ## 3. Pré-requisitos
 - Documentos pessoais dos sócios conforme **IN DREI 81/2020 Art. 35**: RG, CPF, comprovante de residência (últimos 3 meses)
 - Comprovante de estado civil — **CC Art. 977**: cônjuges casados em comunhão universal ou separação obrigatória não podem ser sócios entre si
-- CNPJ dos sócios verificado na Receita Federal (sem pendências)
+- CPF dos sócios (ou CNPJ, quando sócio pessoa jurídica) verificado na Receita Federal (sem pendências)
 - Endereço comercial com contrato de locação ou declaração de sede, acompanhado de IPTU (exigência das Juntas Comerciais)
 - Consulta prévia de viabilidade realizada via **REDESIM** (Lei 11.598/2007 Art. 4º) — verificação de nome, endereço e atividade
 - Acesso aos portais: Junta Comercial do Estado (Lei 8.934/1994), Receita Federal, SEFAZ/Prefeitura
 - Verificação se a atividade é de baixo risco conforme **Lei 13.874/2019 Art. 3º, I** e classificação municipal/estadual
 
 ## 4. Fluxo do Processo
-**Entrada:** Solicitação do cliente com dados dos sócios e objeto social (FOR-SOC-01 ou FOR-SOC-02 para abertura)
+**Entrada:** Solicitação do cliente com dados dos sócios e objeto social (abertura: FOR-SOC-02 + FOR-SOC-01)
 
 **Etapas:**
-1. **Dia 1:** Reunião inicial; coletar checklist FOR-SOC-01 (alteração) ou FOR-SOC-02 (abertura); analisar viabilidade do nome e objeto social conforme **IN DREI 81/2020 Art. 15-19**
+1. **Dia 1:** Reunião inicial de abertura; preencher FOR-SOC-02 (entrada do cliente) e FOR-SOC-01 (checklist técnico interno); analisar viabilidade do nome e objeto social conforme **IN DREI 81/2020 Art. 15-19**
 2. **Dias 2-3:** Consulta prévia de viabilidade via **REDESIM** (Lei 11.598/2007 Art. 4º): nome, endereço e atividade; consulta fiscal para escolha do regime tributário (LC 123/2006 para Simples; CC Art. 966+ para tipo societário)
 3. **Dias 4-7:** Preparar contrato social conforme **CC Art. 997** (sociedade simples) ou **CC Art. 1.054** (sociedade limitada), observando **IN DREI 112/2022**; protocolar na Junta Comercial conforme **Lei 8.934/1994 Art. 32-41**
 4. **Dias 8-10:** Acompanhar deferimento na Junta; obter NIRE/registro conforme **Lei 8.934/1994 Art. 36**
@@ -51,7 +51,7 @@ Gerenciar abertura, alteração e encerramento de empresas dos clientes com qual
 **Saída:** Empresa aberta com todos os documentos, cliente integrado em todas as áreas da SATEC
 
 ## 5. Pontos de Controle de Qualidade
-- [ ] FOR-SOC-01 ou FOR-SOC-02 completo antes de protocolar (nenhum campo vazio)
+- [ ] FOR-SOC-02 (entrada) e FOR-SOC-01 (checklist técnico) completos antes de protocolar (nenhum campo vazio)
 - [ ] Consulta prévia REDESIM (Lei 11.598/2007) realizada com resultado favorável
 - [ ] Viabilidade do nome confirmada conforme IN DREI 81/2020 antes de elaborar contrato
 - [ ] Contrato social em conformidade com CC Livro II e IN DREI 112/2022
@@ -87,7 +87,7 @@ Gerenciar abertura, alteração e encerramento de empresas dos clientes com qual
 | Contrato social / Requerimento (Junta) | Google Drive / SOC / [CNPJ] | Permanente | Lei 8.934/1994, IN DREI 112/2022 |
 | Cartão CNPJ, IE, Alvará | Google Drive / SOC / [CNPJ] | Permanente | Lei 8.934/1994 |
 | Consulta prévia REDESIM | Google Drive / SOC / [CNPJ] | 10 anos | Lei 11.598/2007 |
-| FOR-SOC-01 / FOR-SOC-02 preenchido | Google Drive / SOC / Checklists | 10 anos | IN DREI 81/2020 |
+| FOR-SOC-02 (entrada do cliente) + FOR-SOC-01 (checklist técnico) preenchidos | Google Drive / SOC / Checklists | 10 anos | IN DREI 81/2020 |
 | Declaração de dispensa de alvará (se aplicável) | Google Drive / SOC / [CNPJ] | Permanente | Lei 13.874/2019 Art. 3º |
 | E-mails e comunicações com cliente | Gmail / pasta SOC | 5 anos | — |
 | Termo de consentimento LGPD do cliente | Google Drive / SOC / LGPD | 5 anos após término | Lei 13.709/2018 Art. 16 |
