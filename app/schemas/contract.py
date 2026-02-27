@@ -15,10 +15,10 @@ payment terms, and integration with Autentique for electronic signatures.
 """
 
 from datetime import datetime, date
-from typing import Optional
+from typing import List, Optional
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, EmailStr, model_validator
 
 
 class ContractBase(BaseModel):
@@ -280,3 +280,86 @@ class ContractResponse(ContractBase):
     )
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ContractSignatureSignerRequest(BaseModel):
+    """Signer payload for dispatching a contract to electronic signature."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Signer full name",
+    )
+    email: EmailStr = Field(
+        ...,
+        description="Signer email address",
+    )
+    cpf: Optional[str] = Field(
+        None,
+        max_length=20,
+        description="Signer CPF/CNPJ (optional)",
+    )
+    action: str = Field(
+        default="SIGN",
+        min_length=1,
+        max_length=20,
+        description="Autentique signer action",
+    )
+
+
+class ContractSendForSignatureRequest(BaseModel):
+    """Request body for sending a contract to Autentique."""
+
+    template_name: str = Field(
+        default="default_contract.html",
+        min_length=1,
+        max_length=255,
+        description="Jinja2 template filename used to build the PDF",
+    )
+    show_audit_page: bool = Field(
+        default=True,
+        description="Include audit page on the generated Autentique document",
+    )
+    signers: Optional[List[ContractSignatureSignerRequest]] = Field(
+        default=None,
+        description="Optional signer list (defaults to contract client)",
+    )
+
+    @model_validator(mode="after")
+    def _validate_non_empty_signers(self):
+        if self.signers is not None and len(self.signers) == 0:
+            raise ValueError("signers must contain at least one signer when provided")
+        return self
+
+
+class ContractSignatureSignerResult(BaseModel):
+    """Signer row persisted locally after dispatch."""
+
+    signer_name: str = Field(..., description="Signer name")
+    signer_email: str = Field(..., description="Signer email")
+    status: str = Field(..., description="Current local signature status")
+    autentique_signature_id: Optional[str] = Field(
+        None,
+        description="Autentique signature public_id",
+    )
+    signature_token: Optional[str] = Field(
+        None,
+        description="Autentique signature short link/token",
+    )
+
+
+class ContractSendForSignatureResponse(BaseModel):
+    """Response payload after dispatching contract for signature."""
+
+    contract_id: int = Field(..., description="Contract ID")
+    contract_number: str = Field(..., description="Contract number")
+    status: str = Field(..., description="Updated contract status")
+    autentique_document_id: str = Field(..., description="Autentique document ID")
+    template_name: str = Field(..., description="Template used for PDF generation")
+    signers_created: int = Field(..., ge=0, description="Number of new signature rows")
+    signers_updated: int = Field(..., ge=0, description="Number of updated signature rows")
+    signatures: List[ContractSignatureSignerResult] = Field(
+        default_factory=list,
+        description="Local signatures linked to the dispatched document",
+    )

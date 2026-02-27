@@ -41,13 +41,42 @@ References:
 
 import httpx
 from typing import Dict, Any, Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from urllib.parse import urlencode
+import re
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_error_detail(raw_detail: Any, max_len: int = 300) -> str:
+    """
+    Redact sensitive OAuth material before logging/raising provider errors.
+
+    Masks token-like values and credential fields while keeping enough context
+    (status/code/message) for troubleshooting.
+    """
+    text = str(raw_detail or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(
+        r'("?(?:access_token|refresh_token|client_secret|authorization_code|code)"?\s*[:=]\s*"?)([^",\s]+)("?)',
+        lambda m: f"{m.group(1)}[REDACTED]{m.group(3) or ''}",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(Bearer\s+)([A-Za-z0-9._\-]+)", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(client_secret=)([^&\s]+)", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(refresh_token=)([^&\s]+)", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(access_token=)([^&\s]+)", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(code=)([^&\s]+)", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+
+    if len(text) > max_len:
+        return f"{text[:max_len]}..."
+    return text
 
 
 class ContaAzulError(Exception):
@@ -60,6 +89,15 @@ class ContaAzulAuthError(ContaAzulError):
     pass
 
 
+class ContaAzulInvalidGrantError(ContaAzulAuthError):
+    """Exception raised when refresh_token is invalid, expired, or revoked.
+
+    This error specifically indicates that a full OAuth re-authorization is
+    required — the user must go through the consent flow again.
+    """
+    pass
+
+
 class ContaAzulAPIError(ContaAzulError):
     """Exception raised for API request errors."""
     pass
@@ -67,7 +105,7 @@ class ContaAzulAPIError(ContaAzulError):
 
 class ContaAzulService:
     """
-    Service client for Conta Azul API integration with OAuth 2.0.
+    Service client for Conta Azul API integration with OAuth 2.0 (AWS Cognito).
 
     Provides methods for OAuth 2.0 authentication flow and authenticated
     API requests to Conta Azul's accounting platform.
@@ -76,26 +114,27 @@ class ContaAzulService:
     - CONTA_AZUL_CLIENT_ID: Application client ID
     - CONTA_AZUL_CLIENT_SECRET: Application client secret
     - CONTA_AZUL_REDIRECT_URI: OAuth callback URL
-    - CONTA_AZUL_API_BASE_URL: API base URL (default: https://api.contaazul.com)
+    - CONTA_AZUL_API_BASE_URL: API base URL (default: https://api-v2.contaazul.com)
 
     Attributes:
         client_id: OAuth client ID
         client_secret: OAuth client secret
         redirect_uri: OAuth redirect URI
-        base_url: API base URL
-        auth_url: Authorization endpoint URL
-        token_url: Token endpoint URL
+        api_base_url: API base URL for data requests
+        auth_url: Authorization endpoint URL (Cognito)
+        token_url: Token endpoint URL (Cognito)
     """
 
-    # OAuth 2.0 endpoints
-    AUTH_ENDPOINT = "/auth/authorize"
+    # OAuth 2.0 endpoints (AWS Cognito - migrated from legacy api.contaazul.com)
+    AUTH_BASE_URL = "https://auth.contaazul.com"
+    AUTH_ENDPOINT = "/oauth2/authorize"
     TOKEN_ENDPOINT = "/oauth2/token"
 
     # Token expiration (60 minutes as per Conta Azul documentation)
     TOKEN_LIFETIME_SECONDS = 3600
 
-    # Available OAuth scopes
-    SCOPES = ["sales"]  # Default scope for basic access
+    # OAuth scopes for AWS Cognito (replaces legacy "sales" scope)
+    SCOPES = ["openid", "profile", "aws.cognito.signin.user.admin"]
 
     def __init__(self):
         """
@@ -104,25 +143,33 @@ class ContaAzulService:
         Reads configuration from settings (environment variables).
         Raises ValueError if required credentials are not configured.
         """
-        try:
-            self.client_id = settings.CONTA_AZUL_CLIENT_ID
-            self.client_secret = settings.CONTA_AZUL_CLIENT_SECRET
-            self.redirect_uri = settings.CONTA_AZUL_REDIRECT_URI
-            self.base_url = settings.CONTA_AZUL_API_BASE_URL
+        self.client_id = getattr(settings, "CONTA_AZUL_CLIENT_ID", None)
+        self.client_secret = getattr(settings, "CONTA_AZUL_CLIENT_SECRET", None)
+        self.redirect_uri = getattr(settings, "CONTA_AZUL_REDIRECT_URI", None)
+        self.api_base_url = getattr(settings, "CONTA_AZUL_API_BASE_URL", None)
 
-            # Construct endpoint URLs
-            self.auth_url = f"{self.base_url}{self.AUTH_ENDPOINT}"
-            self.token_url = f"{self.base_url}{self.TOKEN_ENDPOINT}"
-
-            logger.info(f"Conta Azul API service initialized with base URL: {self.base_url}")
-
-        except AttributeError as e:
-            logger.error(f"Missing required Conta Azul configuration: {e}")
-            raise ValueError(
+        # Validate — pydantic-settings may provide empty strings instead of
+        # raising AttributeError, so we must check explicitly.
+        missing = [
+            name for name, val in [
+                ("CONTA_AZUL_CLIENT_ID", self.client_id),
+                ("CONTA_AZUL_CLIENT_SECRET", self.client_secret),
+                ("CONTA_AZUL_REDIRECT_URI", self.redirect_uri),
+            ] if not val
+        ]
+        if missing:
+            msg = (
                 f"Conta Azul API initialization failed. "
-                f"Ensure CONTA_AZUL_CLIENT_ID, CONTA_AZUL_CLIENT_SECRET, "
-                f"and CONTA_AZUL_REDIRECT_URI are set: {e}"
+                f"Missing required configuration: {', '.join(missing)}"
             )
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # Auth endpoints on Cognito domain (auth.contaazul.com)
+        self.auth_url = f"{self.AUTH_BASE_URL}{self.AUTH_ENDPOINT}"
+        self.token_url = f"{self.AUTH_BASE_URL}{self.TOKEN_ENDPOINT}"
+
+        logger.info(f"Conta Azul service initialized - Auth: {self.AUTH_BASE_URL}, API: {self.api_base_url}")
 
     def get_authorization_url(
         self,
@@ -154,8 +201,9 @@ class ContaAzulService:
         scope_string = " ".join(scopes)
 
         params = {
-            "redirect_uri": self.redirect_uri,
+            "response_type": "code",
             "client_id": self.client_id,
+            "redirect_uri": self.redirect_uri,
             "scope": scope_string,
             "state": state
         }
@@ -192,8 +240,11 @@ class ContaAzulService:
             >>> access_token = tokens["access_token"]
             >>> # Store tokens securely for later use
         """
+        # AWS Cognito token exchange - send credentials in body only
         payload = {
             "grant_type": "authorization_code",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
             "redirect_uri": self.redirect_uri,
             "code": code
         }
@@ -205,13 +256,14 @@ class ContaAzulService:
                 response = await client.post(
                     self.token_url,
                     data=payload,
-                    auth=(self.client_id, self.client_secret),
                     headers={"Content-Type": "application/x-www-form-urlencoded"}
                 )
 
+                logger.info(f"Token exchange response status: {response.status_code}")
+
                 if response.status_code != 200:
-                    error_detail = response.text
-                    logger.error(f"Token exchange failed: {response.status_code} - {error_detail}")
+                    error_detail = _sanitize_error_detail(response.text)
+                    logger.error("Token exchange failed with status %s", response.status_code)
                     raise ContaAzulAuthError(
                         f"Failed to exchange authorization code: {response.status_code} - {error_detail}"
                     )
@@ -220,7 +272,7 @@ class ContaAzulService:
 
                 # Calculate token expiration timestamp
                 expires_in = token_data.get("expires_in", self.TOKEN_LIFETIME_SECONDS)
-                expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 token_data["expires_at"] = expires_at.isoformat()
 
                 logger.info("Successfully obtained access token")
@@ -261,25 +313,44 @@ class ContaAzulService:
             ... )
             >>> # Update stored tokens with new values
         """
+        # Send credentials in body ONLY — do NOT also use basic auth header,
+        # as Cognito may reject the request when credentials appear in both places.
         payload = {
             "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
             "refresh_token": refresh_token
         }
 
         try:
             async with httpx.AsyncClient() as client:
-                logger.info("Refreshing access token")
+                logger.info(f"Refreshing access token at {self.token_url}")
 
                 response = await client.post(
                     self.token_url,
                     data=payload,
-                    auth=(self.client_id, self.client_secret),
                     headers={"Content-Type": "application/x-www-form-urlencoded"}
                 )
 
                 if response.status_code != 200:
-                    error_detail = response.text
-                    logger.error(f"Token refresh failed: {response.status_code} - {error_detail}")
+                    raw_error_detail = response.text
+                    error_detail = _sanitize_error_detail(raw_error_detail)
+                    logger.error("Token refresh failed with status %s", response.status_code)
+
+                    # Detect invalid_grant specifically — means refresh_token is
+                    # revoked, expired, or otherwise permanently invalid.
+                    # A full OAuth re-authorization is the only recovery path.
+                    if "invalid_grant" in raw_error_detail.lower():
+                        logger.error(
+                            "INVALID_GRANT detected — refresh_token is permanently "
+                            "invalid. Full OAuth re-authorization required."
+                        )
+                        raise ContaAzulInvalidGrantError(
+                            "Refresh token inválido/expirado/revogado. "
+                            "É necessário reautorizar a integração com o Conta Azul "
+                            "via GET /api/auth/conta-azul/authorize"
+                        )
+
                     raise ContaAzulAuthError(
                         f"Failed to refresh access token: {response.status_code} - {error_detail}"
                     )
@@ -288,12 +359,14 @@ class ContaAzulService:
 
                 # Calculate token expiration timestamp
                 expires_in = token_data.get("expires_in", self.TOKEN_LIFETIME_SECONDS)
-                expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 token_data["expires_at"] = expires_at.isoformat()
 
                 logger.info("Successfully refreshed access token")
                 return token_data
 
+        except (ContaAzulInvalidGrantError, ContaAzulAuthError):
+            raise  # Re-raise auth errors without wrapping
         except httpx.RequestError as e:
             logger.error(f"Network error during token refresh: {e}")
             raise ContaAzulAuthError(f"Network error during token refresh: {e}")
@@ -319,8 +392,12 @@ class ContaAzulService:
         """
         try:
             expiration = datetime.fromisoformat(expires_at)
+            # Ensure timezone-aware comparison: if the stored timestamp is
+            # naive (no tzinfo), assume UTC to avoid TypeError on Python 3.12+
+            if expiration.tzinfo is None:
+                expiration = expiration.replace(tzinfo=timezone.utc)
             # Add 60 second buffer to avoid race conditions
-            return datetime.utcnow() >= (expiration - timedelta(seconds=60))
+            return datetime.now(timezone.utc) >= (expiration - timedelta(seconds=60))
         except (ValueError, TypeError) as e:
             logger.warning(f"Invalid expires_at format: {e}")
             return True  # Assume expired if format is invalid
@@ -360,7 +437,7 @@ class ContaAzulService:
             ...     method="GET"
             ... )
         """
-        url = f"{self.base_url}{endpoint}"
+        url = f"{self.api_base_url}{endpoint}"
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json"
@@ -384,8 +461,8 @@ class ContaAzulService:
                     raise ContaAzulAuthError("Access token is invalid or expired. Please refresh token.")
 
                 if response.status_code >= 400:
-                    error_detail = response.text
-                    logger.error(f"API request failed: {response.status_code} - {error_detail}")
+                    error_detail = _sanitize_error_detail(response.text)
+                    logger.error("API request failed with status %s on %s", response.status_code, endpoint)
                     raise ContaAzulAPIError(
                         f"API request failed: {response.status_code} - {error_detail}"
                     )
@@ -412,38 +489,67 @@ class ContaAzulService:
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve customers from Conta Azul.
+        Retrieve customers (pessoas) from Conta Azul API v2.
+
+        Uses the /v1/pessoas endpoint with pagination parameters.
 
         Args:
             access_token: Valid OAuth access token
-            search: Optional search term to filter customers
-            limit: Maximum number of customers to return (default: 100)
+            search: Optional search term to filter customers (busca)
+            limit: Maximum number of customers per page (tamanho_pagina, default: 100)
 
         Returns:
-            List of customer dictionaries
+            List of customer/pessoa dictionaries
 
         Raises:
             ContaAzulAPIError: If request fails
-
-        Example:
-            >>> service = ContaAzulService()
-            >>> customers = await service.get_customers(
-            ...     access_token=tokens["access_token"],
-            ...     search="João Silva"
-            ... )
         """
-        params = {"size": limit}
-        if search:
-            params["search"] = search
+        all_customers = []
+        page = 1
+        page_size = min(limit, 100)
 
-        response = await self.make_api_request(
-            endpoint="/v1/customers",
-            access_token=access_token,
-            method="GET",
-            params=params
-        )
+        while True:
+            params = {
+                "pagina": page,
+                "tamanho_pagina": page_size
+            }
+            if search:
+                params["busca"] = search
 
-        return response.get("data", [])
+            logger.info(f"Fetching pessoas page {page} (size={page_size})")
+
+            response = await self.make_api_request(
+                endpoint="/v1/pessoas",
+                access_token=access_token,
+                method="GET",
+                params=params
+            )
+
+            # API v2 may return a list directly or wrapped in a data field
+            if isinstance(response, list):
+                customers = response
+            elif isinstance(response, dict):
+                customers = response.get("data", response.get("items", []))
+                # If the dict itself looks like it has pessoa fields, wrap it
+                if not customers and "id" in response:
+                    customers = [response]
+            else:
+                customers = []
+
+            if not customers:
+                break
+
+            all_customers.extend(customers)
+            logger.info(f"Page {page}: got {len(customers)} pessoas (total so far: {len(all_customers)})")
+
+            # Stop if we got fewer than page_size (last page) or reached limit
+            if len(customers) < page_size or len(all_customers) >= limit:
+                break
+
+            page += 1
+
+        logger.info(f"Total pessoas fetched: {len(all_customers)}")
+        return all_customers[:limit]
 
     async def create_customer(
         self,
@@ -475,11 +581,174 @@ class ContaAzulService:
             ... )
         """
         return await self.make_api_request(
-            endpoint="/v1/customers",
+            endpoint="/v1/pessoas",
             access_token=access_token,
             method="POST",
             json_data=customer_data
         )
+
+    # ─── Financial Endpoints (API v2) ───────────────────────────────────
+
+    @staticmethod
+    def _extract_items(response: Any) -> List[Dict[str, Any]]:
+        """Extract list-like payloads from heterogeneous Conta Azul responses."""
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            for key in (
+                "data",
+                "items",
+                "content",
+                "itens",
+                "results",
+                "contas",
+                "contas_financeiras",
+                "contasFinanceiras",
+            ):
+                value = response.get(key)
+                if isinstance(value, list):
+                    return value
+            if "id" in response:
+                return [response]
+        return []
+
+    async def get_contas_receber(
+        self,
+        access_token: str,
+        status_filter: Optional[str] = None,
+        data_vencimento_inicio: Optional[str] = None,
+        data_vencimento_fim: Optional[str] = None,
+        data_vencimento_de: Optional[str] = None,
+        data_vencimento_ate: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve accounts receivable (contas a receber) from Conta Azul API v2.
+        Endpoint: GET /v1/financeiro/eventos-financeiros/contas-a-receber/buscar
+        """
+        data_de = data_vencimento_de or data_vencimento_inicio
+        data_ate = data_vencimento_ate or data_vencimento_fim
+
+        params = {
+            "pagina": 1,
+            "tamanho_pagina": min(limit, 100)
+        }
+        if status_filter:
+            params["status"] = status_filter
+        if data_de:
+            params["data_vencimento_de"] = data_de
+        if data_ate:
+            params["data_vencimento_ate"] = data_ate
+
+        logger.info(f"Fetching contas a receber with params: {params}")
+
+        response = await self.make_api_request(
+            endpoint="/v1/financeiro/eventos-financeiros/contas-a-receber/buscar",
+            access_token=access_token,
+            method="GET",
+            params=params
+        )
+
+        return self._extract_items(response)
+
+    async def get_contas_pagar(
+        self,
+        access_token: str,
+        status_filter: Optional[str] = None,
+        data_vencimento_inicio: Optional[str] = None,
+        data_vencimento_fim: Optional[str] = None,
+        data_vencimento_de: Optional[str] = None,
+        data_vencimento_ate: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve accounts payable (contas a pagar) from Conta Azul API v2.
+        Endpoint: GET /v1/financeiro/eventos-financeiros/contas-a-pagar/buscar
+        """
+        data_de = data_vencimento_de or data_vencimento_inicio
+        data_ate = data_vencimento_ate or data_vencimento_fim
+
+        params = {
+            "pagina": 1,
+            "tamanho_pagina": min(limit, 100)
+        }
+        if status_filter:
+            params["status"] = status_filter
+        if data_de:
+            params["data_vencimento_de"] = data_de
+        if data_ate:
+            params["data_vencimento_ate"] = data_ate
+
+        logger.info(f"Fetching contas a pagar with params: {params}")
+
+        response = await self.make_api_request(
+            endpoint="/v1/financeiro/eventos-financeiros/contas-a-pagar/buscar",
+            access_token=access_token,
+            method="GET",
+            params=params
+        )
+
+        return self._extract_items(response)
+
+    async def get_contas_financeiras(
+        self,
+        access_token: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve financial accounts (contas financeiras) with balances.
+        Endpoint: GET /v1/conta-financeira
+        """
+        logger.info("Fetching contas financeiras")
+
+        # Keep the documented endpoint first, then try legacy variants if empty.
+        attempts = [
+            ("/v1/conta-financeira", None),
+            ("/v1/conta-financeira/busca", {"pagina": 1, "tamanhoPagina": 100}),
+            ("/v1/conta-financeira/buscar", {"pagina": 1, "tamanho_pagina": 100}),
+            ("/v1/contas-financeiras", None),
+        ]
+
+        last_error: Optional[Exception] = None
+        for endpoint, params in attempts:
+            try:
+                request_kwargs: Dict[str, Any] = {
+                    "endpoint": endpoint,
+                    "access_token": access_token,
+                    "method": "GET",
+                }
+                if params is not None:
+                    request_kwargs["params"] = params
+
+                response = await self.make_api_request(
+                    **request_kwargs,
+                )
+                items = self._extract_items(response)
+                if items:
+                    return items
+            except ContaAzulAPIError as exc:
+                last_error = exc
+                logger.warning(f"Failed contas financeiras endpoint {endpoint}: {exc}")
+                continue
+
+        if last_error:
+            raise last_error
+        return []
+
+    async def get_saldo_conta(
+        self,
+        access_token: str,
+        conta_id: str
+    ) -> Dict[str, Any]:
+        """
+        Get current balance of a specific financial account.
+        Endpoint: GET /v1/conta-financeira/{id}/saldo-atual
+        """
+        response = await self.make_api_request(
+            endpoint=f"/v1/conta-financeira/{conta_id}/saldo-atual",
+            access_token=access_token,
+            method="GET"
+        )
+        return response
 
     async def get_contracts(
         self,

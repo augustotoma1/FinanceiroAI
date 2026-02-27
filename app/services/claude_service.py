@@ -1,268 +1,527 @@
 """
-Claude API Service Client
+AI Service Client (Anthropic, Gemini, OpenAI)
 
-This module provides a service client for interacting with Anthropic's Claude API
-for conversational AI capabilities. Used primarily for conducting natural
-conversations to collect contract data from users.
-
-The service handles:
-- Multi-turn conversational data collection
-- System prompt configuration for guided responses
-- Structured data extraction from conversations
-- Error handling and retry logic for API calls
-
-Usage:
-    from app.services.claude_service import ClaudeService
-
-    service = ClaudeService()
-    result = await service.collect_contract_data(conversation_history)
-
-    if result["complete"]:
-        contract_data = result["data"]
-        # Generate contract with collected data
+This module provides a unified service client for conversational AI capabilities.
+It supports multi-provider failover so operations can continue when one provider
+is unavailable.
 """
 
-from anthropic import Anthropic, APIError, APIConnectionError, RateLimitError
-from app.config import settings
-from typing import Dict, List, Any, Optional
+from __future__ import annotations
+
+import asyncio
+import inspect
 import json
 import logging
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+import httpx
+from anthropic import Anthropic, APIError, APIConnectionError, RateLimitError
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+_SUPPORTED_PROVIDERS = {"anthropic", "gemini", "openai"}
 
 
 class ClaudeService:
     """
-    Service client for Anthropic Claude API integration.
+    Unified AI service used by conversation and bot flows.
 
-    Provides methods for conversational AI interactions, specifically designed
-    for collecting contract data through natural language conversations.
-
-    The client automatically reads the API key from the ANTHROPIC_API_KEY
-    environment variable (configured via app.config.settings).
-
-    Attributes:
-        client: Anthropic API client instance
-        model: Claude model to use (default: claude-sonnet-4-20250514)
+    Provider selection:
+    - Primary provider is `settings.AI_PROVIDER`.
+    - Runtime fallback order appends remaining providers and tries available
+      credentials in order.
     """
 
     def __init__(self):
-        """
-        Initialize Claude API client.
+        self.provider = (settings.AI_PROVIDER or "anthropic").strip().lower()
+        if self.provider not in _SUPPORTED_PROVIDERS:
+            logger.warning("Unknown AI_PROVIDER '%s'; using anthropic", self.provider)
+            self.provider = "anthropic"
 
-        The Anthropic client automatically reads ANTHROPIC_API_KEY from the
-        environment. Raises ValueError if the API key is not configured.
-        """
+        self._clients: Dict[str, Any] = {}
+        self.client: Any = None
+        self.model = ""
+
+        # Initialize primary provider eagerly for early misconfiguration detection.
         try:
-            # Client auto-reads ANTHROPIC_API_KEY from environment
-            self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            self.model = settings.ANTHROPIC_MODEL
-            logger.info(f"Claude API service initialized with model: {self.model}")
-        except Exception as e:
-            logger.error(f"Failed to initialize Claude API client: {e}")
-            raise ValueError(f"Claude API initialization failed. Ensure ANTHROPIC_API_KEY is set: {e}")
+            self.client = self._get_provider_client(self.provider)
+            self.model = self._get_provider_model(self.provider)
+            logger.info("AI service initialized: %s (%s)", self.provider, self.model)
+        except Exception as exc:
+            # If no fallback provider is configured, fail-fast.
+            if not self._fallback_candidates(exclude_primary=True):
+                if self.provider == "anthropic":
+                    raise ValueError(
+                        f"Claude API initialization failed. Ensure ANTHROPIC_API_KEY is set: {exc}"
+                    )
+                if self.provider == "gemini":
+                    raise ValueError(
+                        f"Gemini API initialization failed. Ensure GEMINI_API_KEY is set: {exc}"
+                    )
+                raise ValueError(f"AI provider initialization failed ({self.provider}): {exc}")
+            logger.warning(
+                "Primary AI provider initialization failed (%s). Fallback providers will be used. Error: %s",
+                self.provider,
+                exc,
+            )
+
+    def _get_provider_model(self, provider: str) -> str:
+        if provider == "anthropic":
+            return settings.ANTHROPIC_MODEL
+        if provider == "gemini":
+            return settings.GEMINI_MODEL
+        if provider == "openai":
+            return settings.OPENAI_MODEL
+        return ""
+
+    def _has_provider_credentials(self, provider: str) -> bool:
+        if provider == "anthropic":
+            return bool((settings.ANTHROPIC_API_KEY or "").strip())
+        if provider == "gemini":
+            return bool((settings.GEMINI_API_KEY or settings.GOOGLE_API_KEY or "").strip())
+        if provider == "openai":
+            return bool((settings.OPENAI_API_KEY or "").strip())
+        return False
+
+    def _fallback_candidates(self, exclude_primary: bool = False) -> List[str]:
+        # Preferred fallback policy requested by user: gemini -> anthropic -> openai.
+        base_order = [self.provider, "gemini", "anthropic", "openai"]
+        seen = set()
+        ordered: List[str] = []
+        for provider in base_order:
+            if provider in seen:
+                continue
+            seen.add(provider)
+            if not self._has_provider_credentials(provider):
+                continue
+            ordered.append(provider)
+
+        if exclude_primary:
+            return [p for p in ordered if p != self.provider]
+        return ordered
+
+    def _get_provider_client(self, provider: str) -> Any:
+        if provider in self._clients:
+            return self._clients[provider]
+
+        if provider == "anthropic":
+            api_key = (settings.ANTHROPIC_API_KEY or "").strip()
+            if not api_key:
+                raise ValueError("ANTHROPIC_API_KEY is not configured")
+            client = Anthropic(api_key=api_key)
+            self._clients[provider] = client
+            return client
+
+        if provider == "gemini":
+            import google.generativeai as genai  # type: ignore
+
+            gemini_key = (settings.GEMINI_API_KEY or settings.GOOGLE_API_KEY or "").strip()
+            if not gemini_key:
+                raise ValueError("GEMINI_API_KEY/GOOGLE_API_KEY is not configured")
+
+            genai.configure(api_key=gemini_key)
+            client = genai.GenerativeModel(settings.GEMINI_MODEL)
+            self._clients[provider] = client
+            return client
+
+        if provider == "openai":
+            # OpenAI client is implemented through HTTPX calls.
+            self._clients[provider] = None
+            return None
+
+        raise ValueError(f"Unsupported AI provider: {provider}")
+
+    async def _resolve_response(self, response_or_awaitable: Any) -> Any:
+        """
+        Support both sync and async SDK responses.
+        """
+        if inspect.isawaitable(response_or_awaitable):
+            return await response_or_awaitable
+        return response_or_awaitable
+
+    async def _run_with_fallback(
+        self,
+        operation_name: str,
+        runner: Callable[[str], Awaitable[str]],
+    ) -> str:
+        providers = self._fallback_candidates()
+        if not providers:
+            raise ValueError("No AI provider credentials configured")
+
+        last_error: Optional[Exception] = None
+
+        for idx, provider in enumerate(providers):
+            try:
+                _ = self._get_provider_client(provider)
+                text = await runner(provider)
+                if idx > 0:
+                    logger.warning(
+                        "AI fallback activated for %s: using provider '%s'",
+                        operation_name,
+                        provider,
+                    )
+                return text
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "AI provider '%s' failed in %s: %s",
+                    provider,
+                    operation_name,
+                    exc,
+                )
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError("Failed to get AI response")
+
+    def _build_gemini_prompt(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        chunks: List[str] = []
+        if system_prompt:
+            chunks.append(f"SYSTEM:\n{system_prompt}")
+
+        for msg in conversation_history or []:
+            role = "Usuario" if msg.get("role") == "user" else "Assistente"
+            chunks.append(f"{role}: {msg.get('content', '')}")
+
+        chunks.append(f"Usuario: {message}")
+        chunks.append("Assistente:")
+        return "\n\n".join(chunks)
+
+    def _extract_gemini_text(self, response: Any) -> str:
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) or []
+            collected: List[str] = []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str):
+                    collected.append(part_text)
+            if collected:
+                return "\n".join(collected).strip()
+
+        return ""
+
+    async def _gemini_generate(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        max_tokens: int = 1024,
+    ) -> str:
+        prompt = self._build_gemini_prompt(
+            message=message,
+            system_prompt=system_prompt,
+            conversation_history=conversation_history,
+        )
+        generation_config = {"max_output_tokens": max_tokens}
+
+        client = self._get_provider_client("gemini")
+        response = await asyncio.to_thread(
+            client.generate_content,
+            prompt,
+            generation_config=generation_config,
+        )
+
+        text = self._extract_gemini_text(response)
+        if not text:
+            raise ValueError("Empty response from Gemini API")
+        return text
+
+    def _extract_openai_text(self, payload: Dict[str, Any]) -> str:
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+
+        content = (choices[0] or {}).get("message", {}).get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            return "\n".join(parts).strip()
+
+        return ""
+
+    async def _openai_generate(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        max_tokens: int = 1024,
+    ) -> str:
+        api_key = (settings.OPENAI_API_KEY or "").strip()
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is not configured")
+
+        messages: List[Dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        for msg in conversation_history or []:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str):
+                messages.append({"role": role, "content": content})
+
+        messages.append({"role": "user", "content": message})
+
+        payload = {
+            "model": settings.OPENAI_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=45) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+
+        if response.status_code >= 400:
+            snippet = response.text[:300]
+            raise ValueError(f"OpenAI API request failed: {response.status_code} - {snippet}")
+
+        data = response.json()
+        text = self._extract_openai_text(data)
+        if not text:
+            raise ValueError("Empty response from OpenAI API")
+        return text
+
+    async def _anthropic_collect(
+        self,
+        conversation_history: List[Dict[str, str]],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> str:
+        client = self._get_provider_client("anthropic")
+        response = client.messages.create(
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=conversation_history,
+        )
+        response = await self._resolve_response(response)
+        return response.content[0].text
+
+    async def _anthropic_send(
+        self,
+        message: str,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 1024,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        client = self._get_provider_client("anthropic")
+        messages = list(conversation_history or [])
+        messages.append({"role": "user", "content": message})
+
+        params: Dict[str, Any] = {
+            "model": settings.ANTHROPIC_MODEL,
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+        if system_prompt:
+            params["system"] = system_prompt
+
+        response = client.messages.create(**params)
+        response = await self._resolve_response(response)
+        return response.content[0].text
 
     async def collect_contract_data(
         self,
         conversation_history: List[Dict[str, str]],
-        max_tokens: int = 1024
+        max_tokens: int = 1024,
     ) -> Dict[str, Any]:
         """
         Multi-turn conversation to collect all necessary contract data.
 
-        Conducts a natural conversation with the user to gather all required
-        information for generating a service contract. Returns structured data
-        when collection is complete.
-
-        Args:
-            conversation_history: List of message dicts with "role" and "content" keys
-                Example: [{"role": "user", "content": "I need a contract"}, ...]
-            max_tokens: Maximum tokens for Claude's response (default: 1024)
-
-        Returns:
-            Dict with either:
-                - {"complete": False, "message": "Next question from Claude"}
-                - {"complete": True, "data": {...}} when all data collected
-
-        Raises:
-            ValueError: If conversation_history is empty or malformed
-            APIError: If Claude API returns an error
-
-        Example:
-            >>> service = ClaudeService()
-            >>> history = [{"role": "user", "content": "I need a new contract"}]
-            >>> result = await service.collect_contract_data(history)
-            >>> if not result["complete"]:
-            ...     print(result["message"])  # Next question from Claude
+        Returns either:
+        - {"complete": False, "message": "..."}
+        - {"complete": True, "data": {...}}
         """
         if not conversation_history:
             raise ValueError("conversation_history cannot be empty")
 
-        # Validate conversation history format
         for msg in conversation_history:
             if "role" not in msg or "content" not in msg:
                 raise ValueError("Each message must have 'role' and 'content' keys")
             if msg["role"] not in ["user", "assistant"]:
                 raise ValueError("Message role must be 'user' or 'assistant'")
 
-        system_prompt = """You are a financial assistant helping collect information to generate a service contract.
+        system_prompt = """Você é um assistente financeiro que coleta informações para gerar contrato de prestação de serviços.
 
-You need to collect the following information:
-- Client full name and CPF/CNPJ (Brazilian tax ID)
-- Service description and scope
-- Contract value (in Brazilian Real - BRL) and payment terms
-- Start date and duration
-- Special clauses or requirements
+Regras de linguagem:
+- Responda sempre em português brasileiro (pt-BR)
+- Não misture inglês
+- Não use emojis
+- Seja claro, objetivo e cordial
 
-Ask questions naturally, one or two at a time. Be conversational and friendly.
-When you have ALL required information, respond ONLY with valid JSON in this exact format:
+Regras de confiabilidade:
+- Nunca invente dados do cliente, cláusulas, leis, artigos ou jurisprudência
+- Nunca preencha campos obrigatórios por suposição
+- Se faltar informação, faça pergunta objetiva para coletar o dado correto
+- Se o usuário pedir base jurídica e não houver certeza, informe que precisa de validação jurídica humana
+
+Você precisa coletar:
+- Nome completo do cliente e CPF/CNPJ
+- Descrição e escopo do serviço
+- Valor do contrato (em BRL) e condições de pagamento
+- Data de início e duração
+- Cláusulas especiais ou requisitos adicionais
+
+Faça perguntas naturais, uma ou duas por vez.
+Quando tiver TODAS as informações obrigatórias, responda SOMENTE com JSON válido neste formato exato:
 {"complete": true, "data": {"client_name": "...", "cpf_cnpj": "...", "service_description": "...", "contract_value": 0.00, "payment_terms": "...", "start_date": "YYYY-MM-DD", "duration_months": 0, "special_clauses": "..."}}
 
-Important:
-- Do NOT include any text before or after the JSON
-- Ensure the JSON is valid and properly formatted
-- All fields are required before marking complete as true"""
+Importante:
+- Não inclua texto antes ou depois do JSON
+- Garanta JSON válido e bem formatado
+- Só marque complete=true quando todos os campos obrigatórios estiverem preenchidos"""
 
         try:
-            # Make API call to Claude
-            logger.info(f"Sending conversation to Claude with {len(conversation_history)} messages")
+            async def runner(provider: str) -> str:
+                if provider == "anthropic":
+                    logger.info("Sending conversation to Claude with %s messages", len(conversation_history))
+                    return await self._anthropic_collect(
+                        conversation_history=conversation_history,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                    )
 
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=conversation_history
-            )
+                if provider == "gemini":
+                    return await self._gemini_generate(
+                        message="Continue a conversa e peça a próxima informação que falta para o contrato.",
+                        system_prompt=system_prompt,
+                        conversation_history=conversation_history,
+                        max_tokens=max_tokens,
+                    )
 
-            # Extract assistant's response
-            assistant_message = response.content[0].text
-            logger.debug(f"Claude response: {assistant_message[:100]}...")
+                if provider == "openai":
+                    return await self._openai_generate(
+                        message="Continue a conversa e peça a próxima informação que falta para o contrato.",
+                        system_prompt=system_prompt,
+                        conversation_history=conversation_history,
+                        max_tokens=max_tokens,
+                    )
 
-            # Check if data collection is complete
+                raise ValueError(f"Unsupported provider: {provider}")
+
+            assistant_message = await self._run_with_fallback("collect_contract_data", runner)
+            logger.debug("AI response: %s", assistant_message[:100])
+
             if '"complete": true' in assistant_message or '"complete":true' in assistant_message:
                 try:
-                    # Parse structured data from JSON response
                     data = json.loads(assistant_message)
-
-                    # Validate the response structure
                     if not isinstance(data, dict) or "complete" not in data or "data" not in data:
-                        logger.warning("Claude returned malformed completion response")
+                        logger.warning("AI returned malformed completion response")
                         return {
                             "complete": False,
-                            "message": "Please provide any remaining information."
+                            "message": "Perfeito. Agora, por favor, informe os dados que ainda faltam.",
                         }
 
                     logger.info("Contract data collection complete")
                     return data
-
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse Claude's JSON response: {e}")
-                    # Continue conversation if JSON parsing fails
+                except json.JSONDecodeError as exc:
+                    logger.error("Failed to parse AI JSON response: %s", exc)
                     return {
                         "complete": False,
-                        "message": "Could you please confirm all the information again?"
+                        "message": "Pode confirmar novamente as informações para eu concluir o contrato?",
                     }
 
-            # Continue conversation
             return {
                 "complete": False,
-                "message": assistant_message
+                "message": assistant_message,
             }
 
-        except RateLimitError as e:
-            logger.error(f"Claude API rate limit exceeded: {e}")
-            raise APIError(f"Rate limit exceeded. Please try again later: {e}")
-
-        except APIConnectionError as e:
-            logger.error(f"Failed to connect to Claude API: {e}")
-            raise APIError(f"Connection error. Please check your network: {e}")
-
-        except APIError as e:
-            logger.error(f"Claude API error: {e}")
+        except RateLimitError as exc:
+            logger.error("Claude API rate limit exceeded: %s", exc)
             raise
-
-        except Exception as e:
-            logger.error(f"Unexpected error in collect_contract_data: {e}")
-            raise APIError(f"Unexpected error: {e}")
+        except APIConnectionError as exc:
+            logger.error("Failed to connect to Claude API: %s", exc)
+            raise
+        except APIError as exc:
+            logger.error("Claude API error: %s", exc)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error in collect_contract_data: %s", exc)
+            raise ValueError(f"Unexpected error in contract data collection: {exc}")
 
     async def send_message(
         self,
         message: str,
         system_prompt: Optional[str] = None,
         max_tokens: int = 1024,
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
-        Send a single message to Claude and get a response.
-
-        General-purpose method for sending messages to Claude. Useful for
-        one-off queries or custom conversation flows.
-
-        Args:
-            message: The user message to send
-            system_prompt: Optional system prompt to guide Claude's behavior
-            max_tokens: Maximum tokens for response (default: 1024)
-            conversation_history: Optional previous conversation context
-
-        Returns:
-            Claude's text response
-
-        Raises:
-            APIError: If Claude API returns an error
-
-        Example:
-            >>> service = ClaudeService()
-            >>> response = await service.send_message(
-            ...     "Explain contract terms in simple language",
-            ...     system_prompt="You are a legal assistant"
-            ... )
+        Send a single message to AI provider and return text response.
         """
         try:
-            # Build messages array
-            messages = conversation_history or []
-            messages.append({"role": "user", "content": message})
+            async def runner(provider: str) -> str:
+                if provider == "anthropic":
+                    logger.info("Sending single message to Claude")
+                    return await self._anthropic_send(
+                        message=message,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        conversation_history=conversation_history,
+                    )
 
-            logger.info(f"Sending single message to Claude")
+                if provider == "gemini":
+                    logger.info("Sending single message to Gemini")
+                    return await self._gemini_generate(
+                        message=message,
+                        system_prompt=system_prompt,
+                        conversation_history=conversation_history,
+                        max_tokens=max_tokens,
+                    )
 
-            # Create API request parameters
-            params = {
-                "model": self.model,
-                "max_tokens": max_tokens,
-                "messages": messages
-            }
+                if provider == "openai":
+                    logger.info("Sending single message to OpenAI")
+                    return await self._openai_generate(
+                        message=message,
+                        system_prompt=system_prompt,
+                        conversation_history=conversation_history,
+                        max_tokens=max_tokens,
+                    )
 
-            # Add system prompt if provided
-            if system_prompt:
-                params["system"] = system_prompt
+                raise ValueError(f"Unsupported provider: {provider}")
 
-            response = self.client.messages.create(**params)
+            return await self._run_with_fallback("send_message", runner)
 
-            # Extract and return text response
-            return response.content[0].text
-
-        except (RateLimitError, APIConnectionError, APIError) as e:
-            logger.error(f"Claude API error in send_message: {e}")
-            raise APIError(f"Failed to send message: {e}")
-
-        except Exception as e:
-            logger.error(f"Unexpected error in send_message: {e}")
-            raise APIError(f"Unexpected error: {e}")
+        except (RateLimitError, APIConnectionError, APIError) as exc:
+            logger.error("Claude API error in send_message: %s", exc)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error in send_message: %s", exc)
+            raise ValueError(f"Unexpected error in send_message: {exc}")
 
     def validate_collected_data(self, data: Dict[str, Any]) -> tuple[bool, List[str]]:
         """
         Validate that all required contract fields are present and valid.
-
-        Args:
-            data: Dictionary of collected contract data
-
-        Returns:
-            Tuple of (is_valid: bool, errors: List[str])
-
-        Example:
-            >>> service = ClaudeService()
-            >>> is_valid, errors = service.validate_collected_data(data)
-            >>> if not is_valid:
-            ...     print("Missing fields:", errors)
         """
         required_fields = [
             "client_name",
@@ -271,7 +530,7 @@ Important:
             "contract_value",
             "payment_terms",
             "start_date",
-            "duration_months"
+            "duration_months",
         ]
 
         errors = []
@@ -280,7 +539,6 @@ Important:
             if field not in data or not data[field]:
                 errors.append(f"Missing required field: {field}")
 
-        # Additional validation
         if "contract_value" in data:
             try:
                 value = float(data["contract_value"])

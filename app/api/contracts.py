@@ -13,20 +13,73 @@ Endpoints:
 - DELETE /{contract_id} - Delete a contract
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends, Query
+from fastapi import APIRouter, Body, HTTPException, status, Depends, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import logging
+import io
 
 from app.database import get_db
 from app.models.contract import Contract
 from app.models.client import Client
-from app.schemas.contract import ContractCreate, ContractUpdate, ContractResponse
+from app.schemas.contract import (
+    ContractCreate,
+    ContractUpdate,
+    ContractResponse,
+    ContractSendForSignatureRequest,
+    ContractSendForSignatureResponse,
+)
+from app.services.contract_generator import (
+    ContractGenerator,
+    ContractValidationError,
+    ContractTemplateError,
+    ContractPDFError,
+)
+from app.services.contract_signature_service import (
+    ContractSignatureConflictError,
+    ContractSignatureError,
+    ContractSignatureNotFoundError,
+    ContractSignatureProviderError,
+    ContractSignatureValidationError,
+    send_contract_for_signature,
+)
 
 logger = logging.getLogger(__name__)
 
 # Create router with prefix and tags
 router = APIRouter()
+
+
+def _build_template_payload(contract: Contract, client: Client) -> dict:
+    """Map contract + client DB models to contract template payload fields."""
+    return {
+        "client_name": client.name,
+        "cpf_cnpj": client.cpf_cnpj,
+        "service_description": contract.service_description,
+        "contract_value": float(contract.contract_value),
+        "payment_terms": contract.payment_terms,
+        "start_date": contract.start_date.isoformat() if contract.start_date else None,
+        "duration_months": contract.duration_months,
+        "special_clauses": contract.notes or "",
+    }
+
+
+def _get_contract_and_client_or_404(db: Session, contract_id: int) -> tuple[Contract, Client]:
+    contract = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not contract:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Contract with ID {contract_id} not found",
+        )
+
+    client = db.query(Client).filter(Client.id == contract.client_id).first()
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Client with ID {contract.client_id} not found for contract {contract_id}",
+        )
+    return contract, client
 
 
 @router.post("/", response_model=ContractResponse, status_code=status.HTTP_201_CREATED)
@@ -176,7 +229,7 @@ async def list_contracts(
         if client_id:
             query = query.filter(Contract.client_id == client_id)
 
-        # Apply status filter if provided
+        # Apply status filter using explicit query contract.
         if status_filter:
             query = query.filter(Contract.status == status_filter)
 
@@ -191,7 +244,15 @@ async def list_contracts(
         # Apply pagination and ordering
         contracts = query.order_by(Contract.created_at.desc()).offset(skip).limit(limit).all()
 
-        logger.info(f"Retrieved {len(contracts)} contracts (skip={skip}, limit={limit}, search={search}, client_id={client_id}, status={status_filter})")
+        logger.info(
+            "Retrieved %s contracts (skip=%s, limit=%s, search=%s, client_id=%s, status=%s)",
+            len(contracts),
+            skip,
+            limit,
+            search,
+            client_id,
+            status_filter,
+        )
 
         return contracts
 
@@ -417,3 +478,149 @@ async def delete_contract(contract_id: int, db: Session = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete contract"
         )
+
+
+@router.get("/templates/available", status_code=status.HTTP_200_OK)
+async def list_contract_templates():
+    """
+    List available Jinja2 contract templates for dynamic contract rendering.
+    """
+    generator = ContractGenerator()
+    templates = generator.list_available_templates()
+    return {
+        "default_template": "default_contract.html",
+        "templates": templates,
+        "total": len(templates),
+    }
+
+
+@router.get(
+    "/{contract_id}/preview",
+    response_class=HTMLResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def preview_contract_template(
+    contract_id: int,
+    template_name: str = Query("default_contract.html", description="Jinja2 template filename"),
+    db: Session = Depends(get_db),
+):
+    """
+    Render HTML preview of a contract using the selected template.
+    """
+    try:
+        contract, client = _get_contract_and_client_or_404(db, contract_id)
+        payload = _build_template_payload(contract, client)
+        generator = ContractGenerator()
+        html = await generator.generate_contract_html(
+            contract_data=payload,
+            contract_id=contract.contract_number,
+            template_name=template_name,
+        )
+        return HTMLResponse(content=html)
+    except HTTPException:
+        raise
+    except (ContractValidationError, ContractTemplateError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        logger.error("Error previewing contract template for contract %s: %s", contract_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to preview contract template",
+        )
+
+
+@router.get("/{contract_id}/pdf", status_code=status.HTTP_200_OK)
+async def generate_contract_pdf(
+    contract_id: int,
+    template_name: str = Query("default_contract.html", description="Jinja2 template filename"),
+    db: Session = Depends(get_db),
+):
+    """
+    Generate contract PDF bytes using selected template (dynamic Jinja2 rendering).
+    """
+    try:
+        contract, client = _get_contract_and_client_or_404(db, contract_id)
+        payload = _build_template_payload(contract, client)
+        generator = ContractGenerator()
+        pdf_bytes = await generator.generate_contract_pdf(
+            contract_data=payload,
+            contract_id=contract.contract_number,
+            template_name=template_name,
+        )
+        filename = f"{contract.contract_number}.pdf"
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except (ContractValidationError, ContractTemplateError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    except ContractPDFError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        logger.error("Error generating contract PDF for contract %s: %s", contract_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate contract PDF",
+        )
+
+
+@router.post(
+    "/{contract_id}/send-for-signature",
+    response_model=ContractSendForSignatureResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def send_contract_to_signature_provider(
+    contract_id: int,
+    request: ContractSendForSignatureRequest = Body(default_factory=ContractSendForSignatureRequest),
+    db: Session = Depends(get_db),
+):
+    """
+    Generate a contract PDF and send it to Autentique for signature.
+    """
+    try:
+        payload = await send_contract_for_signature(
+            db,
+            contract_id=contract_id,
+            template_name=request.template_name,
+            signers=[signer.model_dump() for signer in request.signers] if request.signers else None,
+            show_audit_page=request.show_audit_page,
+        )
+        return payload
+    except ContractSignatureNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ContractSignatureConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ContractSignatureValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except ContractSignatureProviderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Failed to dispatch contract to Autentique: {exc}",
+        ) from exc
+    except ContractSignatureError as exc:
+        logger.error("Contract signature dispatch failed for contract %s: %s", contract_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to dispatch contract for signature",
+        ) from exc

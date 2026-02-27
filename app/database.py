@@ -10,8 +10,7 @@ The engine is configured from the DATABASE_URL environment variable.
 """
 
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from typing import Generator
 from app.config import settings
 

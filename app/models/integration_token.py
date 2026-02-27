@@ -12,9 +12,9 @@ Security Note: In production environments, consider encrypting the access_token 
 fields using SQLAlchemy encryption libraries (e.g., sqlalchemy-utils with cryptography).
 """
 
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Integer, String, DateTime, Text
 from sqlalchemy.sql import func
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.database import Base
 
 
@@ -82,13 +82,14 @@ class IntegrationToken(Base):
     )
 
     # OAuth 2.0 tokens (consider encryption in production)
+    # Using Text type because AWS Cognito JWT tokens exceed 1000 chars
     access_token = Column(
-        String(1000),
+        Text,
         nullable=False,
         comment="OAuth 2.0 access token - consider encryption in production"
     )
     refresh_token = Column(
-        String(1000),
+        Text,
         nullable=True,
         comment="OAuth 2.0 refresh token for obtaining new access tokens"
     )
@@ -133,7 +134,12 @@ class IntegrationToken(Base):
                 refresh_oauth_token(token)
         """
         buffer = timedelta(minutes=buffer_minutes)
-        return datetime.utcnow() >= (self.expires_at - buffer)
+        now = datetime.now(timezone.utc)
+        # Ensure expires_at is timezone-aware for comparison
+        expires = self.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return now >= (expires - buffer)
 
     def __repr__(self) -> str:
         """String representation of IntegrationToken instance for debugging."""

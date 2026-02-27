@@ -1,0 +1,32 @@
+[
+  {
+    "source_id": "cc_10406_contratos",
+    "title": "Código Civil (Lei nº 10.406/2002) - Regras Gerais de Contratos",
+    "url": "https://www.planalto.gov.br/ccivil_03/leis/2002/l10406.htm",
+    "content": "Referência para contratos privados no Brasil. Pontos operacionais para o agente: exigir agente capaz, objeto lícito/possível/determinado ou determinável e forma admitida em lei para validade do negócio jurídico; observar função social do contrato e boa-fé objetiva; em inadimplemento, considerar perdas e danos, cláusula penal e possibilidade de resolução contratual quando houver descumprimento relevante. Este conteúdo é resumo operacional e deve ser confirmado no texto legal integral antes de decisão jurídica sensível."
+  },
+  {
+    "source_id": "lgpd_13709",
+    "title": "LGPD (Lei nº 13.709/2018) - Tratamento de Dados Pessoais",
+    "url": "https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm",
+    "content": "Base para tratamento de dados em cobrança, contratos e comunicação com clientes. Pontos operacionais: mapear base legal para cada tratamento; garantir transparência e direitos do titular; registrar finalidade, necessidade e retenção; implementar controles de segurança e trilha de auditoria. Para dados sensíveis, menores ou alto risco regulatório, exigir revisão jurídica humana antes da execução."
+  },
+  {
+    "source_id": "licitacoes_14133",
+    "title": "Lei nº 14.133/2021 - Licitações e Contratos Administrativos",
+    "url": "https://www.planalto.gov.br/ccivil_03/_ato2019-2022/2021/lei/L14133.htm",
+    "content": "Referência para contratações com Administração Pública. Pontos operacionais: obedecer regras específicas de habilitação, execução, fiscalização, penalidades, alteração e extinção contratual no regime administrativo; cláusulas e prazos devem seguir o regime legal e o edital/termo de referência. Sempre acionar jurídico em contratos com poder público antes de assinatura."
+  },
+  {
+    "source_id": "assinaturas_14063",
+    "title": "Lei nº 14.063/2020 - Assinaturas Eletrônicas",
+    "url": "https://www.planalto.gov.br/ccivil_03/_ato2019-2022/2020/lei/l14063.htm",
+    "content": "Norma de referência para uso de assinaturas eletrônicas, especialmente em interações com entes públicos. Pontos operacionais: avaliar nível de assinatura exigido pelo contexto; preservar evidências de autoria, integridade e data/hora; manter trilha de auditoria do fluxo de assinatura. Em caso de exigência regulatória específica, prevalece a norma setorial e validação jurídica humana."
+  },
+  {
+    "source_id": "icp_brasil_mp2200",
+    "title": "MP nº 2.200-2/2001 - ICP-Brasil",
+    "url": "https://www.planalto.gov.br/ccivil_03/mpv/antigas_2001/2200-2.htm",
+    "content": "Base normativa para infraestrutura de chaves públicas brasileira e validade de assinaturas com certificado digital ICP-Brasil. Pontos operacionais: quando houver exigência de certificado qualificado, garantir cadeia de certificação e guarda de evidências; para casos litigiosos ou de alto risco, incluir avaliação jurídica sobre adequação probatória do método de assinatura adotado."
+  }
+]

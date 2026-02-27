@@ -25,7 +25,11 @@ from app.schemas.contract import (
     ContractBase,
     ContractCreate,
     ContractUpdate,
-    ContractResponse
+    ContractResponse,
+    ContractSignatureSignerRequest,
+    ContractSendForSignatureRequest,
+    ContractSignatureSignerResult,
+    ContractSendForSignatureResponse,
 )
 from app.schemas.financial import (
     FinancialRecordBase,
@@ -45,6 +49,10 @@ __all__ = [
     "ContractCreate",
     "ContractUpdate",
     "ContractResponse",
+    "ContractSignatureSignerRequest",
+    "ContractSendForSignatureRequest",
+    "ContractSignatureSignerResult",
+    "ContractSendForSignatureResponse",
     # Financial schemas
     "FinancialRecordBase",
     "FinancialRecordCreate",

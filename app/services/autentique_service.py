@@ -38,7 +38,7 @@ from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
 from gql.transport.exceptions import TransportError
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
 import asyncio
 import logging
@@ -98,6 +98,18 @@ class AutentiqueService:
             self.api_key = settings.AUTENTIQUE_API_KEY
             self.rate_limit = settings.AUTENTIQUE_RATE_LIMIT
 
+            # Validate required configuration early — gql silently accepts None
+            if not self.api_key:
+                raise ValueError(
+                    "Autentique API initialization failed. "
+                    "AUTENTIQUE_API_KEY is required but not set."
+                )
+            if not self.api_url:
+                raise ValueError(
+                    "Autentique API initialization failed. "
+                    "AUTENTIQUE_API_URL is required but not set."
+                )
+
             # Rate limiting: track request timestamps in sliding window
             self.request_timestamps = deque()
 
@@ -118,7 +130,10 @@ class AutentiqueService:
 
             logger.info(f"Autentique API service initialized with endpoint: {self.api_url}")
 
-        except AttributeError as e:
+        except ValueError:
+            # Re-raise explicit validation errors from above
+            raise
+        except (AttributeError, TypeError) as e:
             logger.error(f"Missing required Autentique configuration: {e}")
             raise ValueError(
                 f"Autentique API initialization failed. "
@@ -140,7 +155,7 @@ class AutentiqueService:
             >>> service = AutentiqueService()
             >>> await service._wait_for_rate_limit()  # Called internally
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         one_minute_ago = now - timedelta(minutes=1)
 
         # Remove timestamps older than 1 minute from sliding window

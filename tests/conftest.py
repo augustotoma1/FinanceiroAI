@@ -12,21 +12,56 @@ real APIs during tests.
 import os
 import pytest
 from typing import Generator
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.orm import Session
 from fastapi.testclient import TestClient
 
+
+# ── Environment setup MUST come before any app imports ──────────────────────
+# Settings() (via pydantic) validates required env vars at import time.
+# API_SECRET_KEY has no default, so we must inject it before importing app code.
+TEST_API_SECRET_KEY = os.getenv("API_SECRET_KEY", "test-secret-key-for-testing")
+os.environ.setdefault("API_SECRET_KEY", TEST_API_SECRET_KEY)
+
+# Signal to app code (e.g. lifespan) that we are running under pytest
+os.environ["TESTING"] = "1"
+
+# Provide dummy values for other required settings that lack defaults,
+# so tests can import the app without a fully-populated .env file.
+_REQUIRED_SETTINGS_DEFAULTS = {
+    "ANTHROPIC_API_KEY": "test-anthropic-key",
+    "CONTA_AZUL_CLIENT_ID": "test-client-id",
+    "CONTA_AZUL_CLIENT_SECRET": "test-client-secret",
+    "CONTA_AZUL_REDIRECT_URI": "http://localhost:8000/api/auth/conta-azul/callback",
+    "AUTENTIQUE_API_KEY": "test-autentique-key",
+}
+for key, default in _REQUIRED_SETTINGS_DEFAULTS.items():
+    os.environ.setdefault(key, default)
+
+# Test database URL - use separate database for testing.
+# Override with TEST_DATABASE_URL environment variable if provided.
+# Default to SQLite so local test runs don't require a PostgreSQL role/database.
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite:///./tmp_test.db")
+
+# ── Now safe to import app code (Settings will find all required vars) ──────
 from app.database import Base, get_db
 from app.main import app
 from app.config import settings
+import app.models as _app_models  # noqa: F401 - ensure all ORM models are registered in Base.metadata
 
 
-# Test database URL - use separate database for testing
-# Override with TEST_DATABASE_URL environment variable if provided
-TEST_DATABASE_URL = os.getenv(
-    "TEST_DATABASE_URL",
-    "postgresql://user:password@localhost/financial_automation_test"
-)
+def _cleanup_existing_tables(session: Session) -> None:
+    """
+    Delete rows only from tables that actually exist in the current database.
+
+    This protects mixed local SQLite runs from intermittent `no such table`
+    teardown/setup failures when metadata and physical schema drift.
+    """
+    inspector = inspect(session.bind)
+    existing = set(inspector.get_table_names())
+    for table in reversed(Base.metadata.sorted_tables):
+        if table.name in existing:
+            session.execute(table.delete())
 
 
 @pytest.fixture(scope="session")
@@ -40,11 +75,14 @@ def test_engine():
     Yields:
         Engine: SQLAlchemy engine connected to test database
     """
-    engine = create_engine(
-        TEST_DATABASE_URL,
-        pool_pre_ping=True,
-        echo=False  # Set to True to see SQL queries during tests
-    )
+    engine_kwargs = {
+        "pool_pre_ping": True,
+        "echo": False,  # Set to True to see SQL queries during tests
+    }
+    if TEST_DATABASE_URL.startswith("sqlite"):
+        engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+    engine = create_engine(TEST_DATABASE_URL, **engine_kwargs)
 
     # Create all tables
     Base.metadata.create_all(bind=engine)
@@ -61,8 +99,9 @@ def db_session(test_engine) -> Generator[Session, None, None]:
     """
     Create a fresh database session for each test function.
 
-    Each test gets a clean database session that is rolled back after the test.
-    This ensures test isolation - changes made in one test don't affect others.
+    We perform explicit table cleanup to guarantee isolation even when endpoint
+    code calls ``session.commit()`` internally. This approach is deterministic
+    across SQLite/PostgreSQL test environments.
 
     Args:
         test_engine: SQLAlchemy engine from test_engine fixture
@@ -70,20 +109,22 @@ def db_session(test_engine) -> Generator[Session, None, None]:
     Yields:
         Session: SQLAlchemy database session for testing
     """
-    # Create a new session for this test
-    TestSessionLocal = sessionmaker(
-        autocommit=False,
-        autoflush=False,
-        bind=test_engine
-    )
+    # Ensure newly registered metadata tables are materialized before each test
+    # (prevents intermittent "no such table" when import order changes).
+    Base.metadata.create_all(bind=test_engine)
 
-    session = TestSessionLocal()
+    session = Session(bind=test_engine)
+
+    # Ensure clean start for every test function
+    _cleanup_existing_tables(session)
+    session.commit()
 
     try:
         yield session
     finally:
-        # Rollback any changes made during the test
         session.rollback()
+        _cleanup_existing_tables(session)
+        session.commit()
         session.close()
 
 
@@ -115,7 +156,7 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 
     app.dependency_overrides[get_db] = override_get_db
 
-    with TestClient(app) as test_client:
+    with TestClient(app, headers={"X-API-Key": TEST_API_SECRET_KEY}) as test_client:
         yield test_client
 
     # Clear dependency overrides after test

@@ -12,11 +12,34 @@ Tests cover:
 
 import pytest
 import json
-from unittest.mock import Mock, patch, MagicMock
+import httpx
+from unittest.mock import Mock, patch, MagicMock, AsyncMock
 from anthropic import APIError, APIConnectionError, RateLimitError
 
 from app.services.claude_service import ClaudeService
 from app.config import settings
+
+
+# ── Helper factories for anthropic SDK exceptions ───────────────────────────
+# The SDK exceptions require httpx objects, not just a string message.
+
+def _make_api_error(message: str = "API error") -> APIError:
+    """Create a properly-constructed APIError for tests."""
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return APIError(message, request=request, body=None)
+
+
+def _make_rate_limit_error(message: str = "Rate limit exceeded") -> RateLimitError:
+    """Create a properly-constructed RateLimitError for tests."""
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(429, request=request)
+    return RateLimitError(message, response=response, body=None)
+
+
+def _make_connection_error(message: str = "Connection failed") -> APIConnectionError:
+    """Create a properly-constructed APIConnectionError for tests."""
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return APIConnectionError(message=message, request=request)
 
 
 class TestClaudeServiceInitialization:
@@ -179,50 +202,50 @@ class TestCollectContractData:
 
     @pytest.mark.asyncio
     async def test_collect_data_rate_limit_error(self, service):
-        """Test handling of API rate limit error"""
+        """Test handling of API rate limit error — re-raised as-is"""
         conversation_history = [
             {"role": "user", "content": "Test message"}
         ]
 
-        service.client.messages.create = Mock(side_effect=RateLimitError("Rate limit exceeded"))
+        service.client.messages.create = Mock(side_effect=_make_rate_limit_error())
 
-        with pytest.raises(APIError, match="Rate limit exceeded"):
+        with pytest.raises(RateLimitError):
             await service.collect_contract_data(conversation_history)
 
     @pytest.mark.asyncio
     async def test_collect_data_connection_error(self, service):
-        """Test handling of API connection error"""
+        """Test handling of API connection error — re-raised as-is"""
         conversation_history = [
             {"role": "user", "content": "Test message"}
         ]
 
-        service.client.messages.create = Mock(side_effect=APIConnectionError("Connection failed"))
+        service.client.messages.create = Mock(side_effect=_make_connection_error())
 
-        with pytest.raises(APIError, match="Connection error"):
+        with pytest.raises(APIConnectionError):
             await service.collect_contract_data(conversation_history)
 
     @pytest.mark.asyncio
     async def test_collect_data_generic_api_error(self, service):
-        """Test handling of generic API error"""
+        """Test handling of generic API error — re-raised as-is"""
         conversation_history = [
             {"role": "user", "content": "Test message"}
         ]
 
-        service.client.messages.create = Mock(side_effect=APIError("API error"))
+        service.client.messages.create = Mock(side_effect=_make_api_error())
 
         with pytest.raises(APIError):
             await service.collect_contract_data(conversation_history)
 
     @pytest.mark.asyncio
     async def test_collect_data_unexpected_error(self, service):
-        """Test handling of unexpected error"""
+        """Test handling of unexpected error — wrapped in ValueError"""
         conversation_history = [
             {"role": "user", "content": "Test message"}
         ]
 
         service.client.messages.create = Mock(side_effect=Exception("Unexpected error"))
 
-        with pytest.raises(APIError, match="Unexpected error"):
+        with pytest.raises(ValueError, match="Unexpected error"):
             await service.collect_contract_data(conversation_history)
 
     @pytest.mark.asyncio
@@ -240,6 +263,22 @@ class TestCollectContractData:
 
         call_kwargs = service.client.messages.create.call_args[1]
         assert call_kwargs["max_tokens"] == 2048
+
+    @pytest.mark.asyncio
+    async def test_collect_data_supports_async_sdk_response(self, service):
+        """Test collect_contract_data works when SDK returns coroutine."""
+        conversation_history = [{"role": "user", "content": "I need a contract"}]
+        mock_response = Mock()
+        mock_response.content = [Mock(text="Great! What's the client name?")]
+
+        async def async_create(**kwargs):
+            return mock_response
+
+        service.client.messages.create = async_create
+
+        result = await service.collect_contract_data(conversation_history)
+        assert result["complete"] is False
+        assert "client" in result["message"].lower()
 
 
 class TestSendMessage:
@@ -315,35 +354,66 @@ class TestSendMessage:
 
     @pytest.mark.asyncio
     async def test_send_message_api_error(self, service):
-        """Test handling of API error during message send"""
-        service.client.messages.create = Mock(side_effect=APIError("API error"))
+        """Test handling of API error during message send — re-raised as-is"""
+        service.client.messages.create = Mock(side_effect=_make_api_error())
 
-        with pytest.raises(APIError, match="Failed to send message"):
+        with pytest.raises(APIError):
             await service.send_message("Test message")
 
     @pytest.mark.asyncio
     async def test_send_message_connection_error(self, service):
-        """Test handling of connection error during message send"""
-        service.client.messages.create = Mock(side_effect=APIConnectionError("Connection failed"))
+        """Test handling of connection error during message send — re-raised as-is"""
+        service.client.messages.create = Mock(side_effect=_make_connection_error())
 
-        with pytest.raises(APIError, match="Failed to send message"):
+        with pytest.raises(APIConnectionError):
             await service.send_message("Test message")
 
     @pytest.mark.asyncio
     async def test_send_message_rate_limit_error(self, service):
-        """Test handling of rate limit error during message send"""
-        service.client.messages.create = Mock(side_effect=RateLimitError("Rate limit"))
+        """Test handling of rate limit error during message send — re-raised as-is"""
+        service.client.messages.create = Mock(side_effect=_make_rate_limit_error())
 
-        with pytest.raises(APIError, match="Failed to send message"):
+        with pytest.raises(RateLimitError):
             await service.send_message("Test message")
 
     @pytest.mark.asyncio
     async def test_send_message_unexpected_error(self, service):
-        """Test handling of unexpected error during message send"""
+        """Test handling of unexpected error during message send — wrapped in ValueError"""
         service.client.messages.create = Mock(side_effect=Exception("Unexpected"))
 
-        with pytest.raises(APIError, match="Unexpected error"):
+        with pytest.raises(ValueError, match="Unexpected error"):
             await service.send_message("Test message")
+
+    @pytest.mark.asyncio
+    async def test_send_message_supports_async_sdk_response(self, service):
+        """Test send_message works when SDK returns coroutine."""
+        mock_response = Mock()
+        mock_response.content = [Mock(text="Async response")]
+
+        async def async_create(**kwargs):
+            return mock_response
+
+        service.client.messages.create = async_create
+
+        response = await service.send_message("Hello Claude")
+        assert response == "Async response"
+
+    @pytest.mark.asyncio
+    async def test_send_message_fallback_to_openai_after_provider_failures(self, service):
+        """Test fallback chain reaches OpenAI when Gemini/Claude fail."""
+        service.provider = "gemini"
+        service._fallback_candidates = Mock(return_value=["gemini", "anthropic", "openai"])
+        service._get_provider_client = Mock(return_value=object())
+        service._gemini_generate = AsyncMock(side_effect=ValueError("gemini down"))
+        service._anthropic_send = AsyncMock(side_effect=ValueError("claude down"))
+        service._openai_generate = AsyncMock(return_value="openai fallback ok")
+
+        result = await service.send_message("hello")
+
+        assert result == "openai fallback ok"
+        service._gemini_generate.assert_awaited_once()
+        service._anthropic_send.assert_awaited_once()
+        service._openai_generate.assert_awaited_once()
 
 
 class TestValidateCollectedData:

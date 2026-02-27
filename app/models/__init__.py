@@ -10,6 +10,8 @@ Models:
     - FinancialRecord: Financial transaction records for invoices, payments, and receivables
     - Signature: Electronic signature tracking for contract workflow
     - IntegrationToken: OAuth token storage for external services (Conta Azul, etc.)
+    - OAuthState: One-time OAuth state tokens persisted for CSRF protection
+    - CashRiskSnapshot: Daily CFO snapshot with cash risk and projection indicators
 """
 
 from app.models.client import Client
@@ -17,6 +19,9 @@ from app.models.contract import Contract
 from app.models.financial_record import FinancialRecord
 from app.models.signature import Signature
 from app.models.integration_token import IntegrationToken
+from app.models.conversation import Conversation
+from app.models.oauth_state import OAuthState
+from app.models.cash_risk_snapshot import CashRiskSnapshot
 
 __all__ = [
     "Client",
@@ -24,4 +29,7 @@ __all__ = [
     "FinancialRecord",
     "Signature",
     "IntegrationToken",
+    "Conversation",
+    "OAuthState",
+    "CashRiskSnapshot",
 ]

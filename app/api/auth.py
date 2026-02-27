@@ -11,23 +11,146 @@ Endpoints:
 - GET /conta-azul/status - Check current OAuth connection status
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends, Query
+from fastapi import APIRouter, HTTPException, status, Depends, Query, Request
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import logging
 import secrets
 from sqlalchemy.orm import Session
 
 from app.services.conta_azul_service import ContaAzulService, ContaAzulAuthError
+from app.services.signature_sync_service import (
+    sync_signatures_for_document,
+    sync_signatures_from_autentique,
+)
+from app.config import settings
 from app.database import get_db
 from app.models.integration_token import IntegrationToken
+from app.models.oauth_state import OAuthState
+from app.api.dependencies import verify_api_key
 
 logger = logging.getLogger(__name__)
 
 # Create router with prefix and tags
 router = APIRouter()
+
+_STATE_TTL_SECONDS = 600  # 10 minutes — enough time for user to approve on Conta Azul
+
+
+def _store_oauth_state(db: Session, state: str) -> None:
+    """Persist OAuth state token with TTL in database for multi-worker safety."""
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=_STATE_TTL_SECONDS)
+    try:
+        # Best-effort cleanup to keep table bounded.
+        db.query(OAuthState).filter(OAuthState.expires_at < now).delete(
+            synchronize_session=False
+        )
+        db.add(OAuthState(state=state, expires_at=expires_at))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _validate_and_consume_oauth_state(db: Session, state: str | None) -> bool:
+    """Validate state token exists and hasn't expired, then consume it (one-time use)."""
+    if not state:
+        return False
+
+    now = datetime.now(timezone.utc)
+    try:
+        db.query(OAuthState).filter(OAuthState.expires_at < now).delete(
+            synchronize_session=False
+        )
+        state_record = db.query(OAuthState).filter(OAuthState.state == state).first()
+        if not state_record:
+            db.commit()
+            return False
+
+        expires_at = state_record.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        is_valid = expires_at > now
+        db.delete(state_record)
+        db.commit()
+        return is_valid
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _extract_document_ids(payload: object) -> list[str]:
+    """
+    Extract candidate document IDs from flexible webhook payloads.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: object) -> None:
+        text = _as_text(value)
+        if not text or text in seen:
+            return
+        seen.add(text)
+        ids.append(text)
+
+    if not isinstance(payload, dict):
+        return ids
+
+    _push(payload.get("document_id"))
+    _push(payload.get("documentId"))
+    _push(payload.get("id"))
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        _push(data.get("document_id"))
+        _push(data.get("documentId"))
+        _push(data.get("id"))
+        nested_doc = data.get("document")
+        if isinstance(nested_doc, dict):
+            _push(nested_doc.get("id"))
+
+    document = payload.get("document")
+    if isinstance(document, dict):
+        _push(document.get("id"))
+
+    documents = payload.get("documents")
+    if isinstance(documents, list):
+        for item in documents:
+            if isinstance(item, dict):
+                _push(item.get("id"))
+
+    return ids
+
+
+def _extract_webhook_secret(request: Request) -> str:
+    """
+    Resolve webhook secret from headers/query.
+    """
+    candidates = [
+        request.headers.get("x-webhook-token"),
+        request.headers.get("x-autentique-token"),
+        request.query_params.get("token"),
+    ]
+
+    auth_header = _as_text(request.headers.get("authorization"))
+    if auth_header.lower().startswith("bearer "):
+        candidates.append(auth_header[7:].strip())
+
+    for value in candidates:
+        token = _as_text(value)
+        if token:
+            return token
+    return ""
 
 
 # Pydantic schemas for request/response validation
@@ -38,15 +161,14 @@ class OAuthStatusResponse(BaseModel):
     expires_at: Optional[datetime] = Field(None, description="Token expiration timestamp")
     created_at: Optional[datetime] = Field(None, description="Connection creation timestamp")
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "service": "conta_azul",
-                "connected": True,
-                "expires_at": "2026-02-06T18:00:00Z",
-                "created_at": "2026-02-06T12:00:00Z"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "service": "conta_azul",
+            "connected": True,
+            "expires_at": "2026-02-06T18:00:00Z",
+            "created_at": "2026-02-06T12:00:00Z"
         }
+    })
 
 
 class OAuthCallbackResponse(BaseModel):
@@ -56,19 +178,18 @@ class OAuthCallbackResponse(BaseModel):
     expires_at: str = Field(..., description="Token expiration timestamp")
     created_at: datetime = Field(..., description="Connection creation timestamp")
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "message": "Successfully connected to Conta Azul",
-                "service": "conta_azul",
-                "expires_at": "2026-02-06T18:00:00Z",
-                "created_at": "2026-02-06T12:00:00Z"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "message": "Successfully connected to Conta Azul",
+            "service": "conta_azul",
+            "expires_at": "2026-02-06T18:00:00Z",
+            "created_at": "2026-02-06T12:00:00Z"
         }
+    })
 
 
 @router.get("/conta-azul/authorize", status_code=status.HTTP_302_FOUND)
-async def conta_azul_authorize():
+async def conta_azul_authorize(db: Session = Depends(get_db)):
     """
     Initiate OAuth 2.0 authorization flow with Conta Azul.
 
@@ -97,17 +218,16 @@ async def conta_azul_authorize():
         # Initialize Conta Azul service
         service = ContaAzulService()
 
-        # Generate random state for CSRF protection
-        # In production, store this state in session or cache and verify in callback
+        # Generate random state for CSRF protection and store it
         state = secrets.token_urlsafe(32)
+        _store_oauth_state(db, state)
 
-        # Get authorization URL
+        # Get authorization URL with Cognito scopes
         authorization_url = service.get_authorization_url(
-            state=state,
-            scope=["sales"]  # Request sales scope for customer and contract access
+            state=state
         )
 
-        logger.info(f"Redirecting to Conta Azul authorization page with state: {state[:10]}...")
+        logger.info("Redirecting to Conta Azul authorization page")
 
         # Redirect user to Conta Azul authorization page
         return RedirectResponse(
@@ -171,9 +291,13 @@ async def conta_azul_callback(
             detail="Authorization code is required"
         )
 
-    # TODO: In production, verify state token against stored value for CSRF protection
-    # For now, we just log it for debugging
-    logger.info(f"Received OAuth callback with state: {state[:10] if state else 'None'}...")
+    # Validate state token for CSRF protection (one-time use)
+    if not _validate_and_consume_oauth_state(db, state):
+        logger.warning("OAuth callback with invalid or expired state token")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired state token. Please restart the authorization flow."
+        )
 
     try:
         # Initialize Conta Azul service
@@ -200,12 +324,11 @@ async def conta_azul_callback(
             expires_at = datetime.fromisoformat(expires_at_str)
         except (ValueError, TypeError):
             # Fallback to 1 hour from now if parsing fails
-            from datetime import timedelta
-            expires_at = datetime.utcnow() + timedelta(hours=1)
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
             logger.warning("Could not parse expires_at, using default 1 hour")
 
         # Store tokens in database (upsert pattern)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         existing_token = db.query(IntegrationToken).filter_by(service="conta_azul").first()
 
         if existing_token:
@@ -246,7 +369,7 @@ async def conta_azul_callback(
         logger.error(f"Authentication error during OAuth callback: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Failed to authenticate with Conta Azul: {str(e)}"
+            detail="Failed to authenticate with Conta Azul"
         )
     except HTTPException:
         raise  # Re-raise HTTP exceptions
@@ -261,7 +384,10 @@ async def conta_azul_callback(
 
 
 @router.get("/conta-azul/status", response_model=OAuthStatusResponse, status_code=status.HTTP_200_OK)
-async def conta_azul_status(db: Session = Depends(get_db)):
+async def conta_azul_status(
+    _api_key: str = Depends(verify_api_key),
+    db: Session = Depends(get_db),
+):
     """
     Check current Conta Azul OAuth connection status.
 
@@ -313,3 +439,73 @@ async def conta_azul_status(db: Session = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to check OAuth connection status"
         )
+
+
+@router.post("/autentique/webhook", status_code=status.HTTP_200_OK)
+async def autentique_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Receive Autentique webhook notifications and trigger signature reconciliation.
+    """
+    if not bool(getattr(settings, "AUTENTIQUE_WEBHOOK_ENABLED", True)):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Autentique webhook is disabled",
+        )
+
+    expected_secret = _as_text(getattr(settings, "AUTENTIQUE_WEBHOOK_SECRET", ""))
+    if expected_secret:
+        provided_secret = _extract_webhook_secret(request)
+        if not secrets.compare_digest(provided_secret, expected_secret):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid webhook secret",
+            )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    document_ids = _extract_document_ids(payload)
+    results: list[dict[str, object]] = []
+
+    if document_ids:
+        for document_id in document_ids:
+            result = await sync_signatures_for_document(db, document_id=document_id)
+            results.append(
+                {
+                    "document_id": document_id,
+                    "success": bool(result.get("success")),
+                    "processed_contracts": int(result.get("processed_contracts", 0)),
+                    "error_count": int(result.get("error_count", 0)),
+                    "skipped": bool(result.get("skipped", False)),
+                    "reason": result.get("reason"),
+                }
+            )
+
+        return {
+            "ok": True,
+            "mode": "document",
+            "documents": results,
+            "count": len(results),
+        }
+
+    fallback_max = max(
+        1,
+        int(getattr(settings, "AUTENTIQUE_WEBHOOK_FALLBACK_MAX_CONTRACTS", 20)),
+    )
+    fallback_result = await sync_signatures_from_autentique(
+        db,
+        max_contracts=fallback_max,
+        only_open_contracts=True,
+    )
+    return {
+        "ok": bool(fallback_result.get("success") or fallback_result.get("partial_success")),
+        "mode": "fallback",
+        "max_contracts": fallback_max,
+        "processed_contracts": int(fallback_result.get("processed_contracts", 0)),
+        "error_count": int(fallback_result.get("error_count", 0)),
+    }

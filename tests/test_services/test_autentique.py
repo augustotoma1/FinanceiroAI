@@ -14,7 +14,7 @@ Tests cover:
 
 import pytest
 from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from gql.transport.exceptions import TransportError
 
 from app.services.autentique_service import (
@@ -82,7 +82,7 @@ class TestRateLimiting:
     async def test_rate_limit_allows_requests_under_limit(self, service):
         """Test that requests under rate limit are allowed immediately"""
         # Add some timestamps within the window
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         service.request_timestamps.extend([
             now - timedelta(seconds=30),
             now - timedelta(seconds=20),
@@ -98,7 +98,7 @@ class TestRateLimiting:
     @pytest.mark.asyncio
     async def test_rate_limit_removes_old_timestamps(self, service):
         """Test that timestamps older than 1 minute are removed"""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         service.request_timestamps.extend([
             now - timedelta(minutes=2),
             now - timedelta(minutes=1, seconds=30),
@@ -114,7 +114,7 @@ class TestRateLimiting:
     async def test_rate_limit_enforces_wait_when_limit_reached(self, service):
         """Test that rate limiting waits when limit is reached"""
         # Fill up to rate limit
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         oldest_timestamp = now - timedelta(seconds=30)
 
         service.request_timestamps.extend([

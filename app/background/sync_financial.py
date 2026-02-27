@@ -2,9 +2,9 @@
 Financial Data Synchronization Background Job
 
 This module provides a background job for synchronizing financial data between
-Conta Azul accounting platform and the local database. The job fetches invoices,
-payments, and receivables from Conta Azul and creates or updates local
-FinancialRecord records.
+Conta Azul accounting platform and the local database. The job fetches
+contas a receber and contas a pagar from Conta Azul and creates or updates
+local FinancialRecord records.
 
 The synchronization uses conta_azul_id as the natural key to match financial
 records and implements an upsert pattern to avoid duplicates.
@@ -19,12 +19,13 @@ Usage:
     scheduler.add_job(sync_financial_job, 'interval', hours=24)
 """
 
+import hashlib
 import logging
-from datetime import datetime, date
+import re
+from datetime import datetime, date, timezone, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from decimal import Decimal
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import SessionLocal
 from app.models.financial_record import FinancialRecord
@@ -33,10 +34,18 @@ from app.models.integration_token import IntegrationToken
 from app.services.conta_azul_service import (
     ContaAzulService,
     ContaAzulError,
-    ContaAzulAuthError
+    ContaAzulAuthError,
+    ContaAzulInvalidGrantError,
 )
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_LOOKBACK_DAYS = 365
+DEFAULT_LOOKAHEAD_DAYS = 365
+MAX_RECORDS_PER_SOURCE = 500
+PAGE_SIZE = 100
+PAID_STATUSES = {"QUITADO", "RECEBIDO", "PAGO", "ACQUITTED", "PAID"}
+CANCELED_STATUSES = {"CANCELADO", "CANCELED", "VOID"}
 
 
 class FinancialSyncError(Exception):
@@ -54,24 +63,36 @@ class FinancialSyncDataError(FinancialSyncError):
     pass
 
 
-async def sync_financial_job() -> Dict[str, Any]:
+async def sync_financial_job(
+    data_vencimento_de: Optional[str] = None,
+    data_vencimento_ate: Optional[str] = None,
+    max_records_per_source: int = MAX_RECORDS_PER_SOURCE,
+) -> Dict[str, Any]:
     """
     Background job to synchronize financial data from Conta Azul to local database.
 
     This job performs the following steps:
     1. Retrieve valid Conta Azul OAuth token from database
-    2. Fetch all invoices, sales, and receivables from Conta Azul API
-    3. For each financial transaction, create new or update existing FinancialRecord
-    4. Use conta_azul_id as natural key for matching
+    2. Fetch contas a receber and contas a pagar from Conta Azul API v2
+    3. For each financial event, create new or update existing FinancialRecord
+    4. Use a stable source-prefixed conta_azul_id as natural key
     5. Update last_synced_at timestamp on all synced records
     6. Calculate days_overdue for pending/overdue transactions
 
     The job uses an upsert pattern (update if exists, create if not) to handle
     both new financial records and updates to existing records.
 
+    Args:
+        data_vencimento_de: Optional due-date range start (ISO date string).
+            If omitted with data_vencimento_ate, uses default rolling window.
+        data_vencimento_ate: Optional due-date range end (ISO date string).
+            If omitted with data_vencimento_de, uses default rolling window.
+        max_records_per_source: Max records fetched for each source (receber/pagar).
+
     Returns:
         Dict containing synchronization results:
             - success: bool indicating if sync completed successfully
+            - partial_success: bool indicating partial completion with errors
             - synced_count: number of financial records synced
             - created_count: number of new records created
             - updated_count: number of existing records updated
@@ -89,7 +110,7 @@ async def sync_financial_job() -> Dict[str, Any]:
         >>> if result['errors']:
         ...     print(f"Encountered {result['error_count']} errors")
     """
-    start_time = datetime.utcnow()
+    start_time = datetime.now(timezone.utc)
     logger.info("Starting financial data synchronization job")
 
     db: Session = SessionLocal()
@@ -107,49 +128,74 @@ async def sync_financial_job() -> Dict[str, Any]:
         # Step 2: Fetch financial data from Conta Azul
         logger.info("Fetching financial data from Conta Azul API")
         conta_azul_service = ContaAzulService()
+        data_vencimento_de, data_vencimento_ate = _resolve_sync_window(
+            data_vencimento_de=data_vencimento_de,
+            data_vencimento_ate=data_vencimento_ate,
+        )
+        max_records_per_source = max(1, int(max_records_per_source))
+        financial_transactions: List[Dict[str, Any]] = []
+        source_fetch_errors: List[str] = []
+        source_totals: Dict[str, int] = {"receber": 0, "pagar": 0}
 
-        # TODO: Implement get_sales/get_invoices method in ContaAzulService
-        # For now, this will raise an AttributeError until the methods are implemented
-        # The following methods need to be added to conta_azul_service.py:
-        # - get_sales(access_token, limit) -> List[Dict]
-        # - get_bills_to_receive(access_token, limit) -> List[Dict]
+        sources = [
+            ("receber", "/v1/financeiro/eventos-financeiros/contas-a-receber/buscar"),
+            ("pagar", "/v1/financeiro/eventos-financeiros/contas-a-pagar/buscar"),
+        ]
 
-        financial_transactions = []
+        for source_kind, endpoint in sources:
+            try:
+                items = await _fetch_financial_items_paginated(
+                    service=conta_azul_service,
+                    access_token=access_token,
+                    endpoint=endpoint,
+                    data_vencimento_de=data_vencimento_de,
+                    data_vencimento_ate=data_vencimento_ate,
+                    max_records=max_records_per_source,
+                    page_size=PAGE_SIZE,
+                )
+                source_totals[source_kind] = len(items)
+                for item in items:
+                    item["_sync_kind"] = source_kind
+                    financial_transactions.append(item)
+                logger.info(f"Retrieved {len(items)} records from contas a {source_kind}")
+            except ContaAzulError as e:
+                fetch_error = f"Failed to fetch contas a {source_kind}: {e}"
+                source_fetch_errors.append(fetch_error)
+                logger.error(fetch_error)
 
-        # Fetch sales/invoices (outgoing - receivables)
-        try:
-            sales = await conta_azul_service.get_sales(
-                access_token=access_token,
-                limit=1000  # Fetch up to 1000 sales per sync
-            )
-            financial_transactions.extend(sales)
-            logger.info(f"Retrieved {len(sales)} sales from Conta Azul")
-        except AttributeError:
-            logger.warning(
-                "ContaAzulService.get_sales() not implemented yet. "
-                "Skipping sales synchronization."
-            )
+        if not financial_transactions and source_fetch_errors:
+            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+            return {
+                "success": False,
+                "partial_success": False,
+                "synced_count": 0,
+                "created_count": 0,
+                "updated_count": 0,
+                "error_count": len(source_fetch_errors),
+                "errors": source_fetch_errors,
+                "source_totals": source_totals,
+                "window": {
+                    "data_vencimento_de": data_vencimento_de,
+                    "data_vencimento_ate": data_vencimento_ate,
+                },
+                "duration_seconds": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
-        # Fetch bills to receive (receivables)
-        try:
-            receivables = await conta_azul_service.get_bills_to_receive(
-                access_token=access_token,
-                limit=1000  # Fetch up to 1000 receivables per sync
-            )
-            financial_transactions.extend(receivables)
-            logger.info(f"Retrieved {len(receivables)} receivables from Conta Azul")
-        except AttributeError:
-            logger.warning(
-                "ContaAzulService.get_bills_to_receive() not implemented yet. "
-                "Skipping receivables synchronization."
-            )
+        logger.info(
+            "Retrieved %s total financial events from Conta Azul "
+            "(receber=%s, pagar=%s)",
+            len(financial_transactions),
+            source_totals["receber"],
+            source_totals["pagar"],
+        )
 
-        logger.info(f"Retrieved {len(financial_transactions)} total financial transactions from Conta Azul")
-
-        # Step 3: Process each financial transaction
+        # Step 3: Process each financial event with per-item SAVEPOINT to avoid
+        # one broken payload aborting the entire synchronization batch.
         for transaction_data in financial_transactions:
             try:
-                created, updated = await _sync_single_transaction(db, transaction_data)
+                with db.begin_nested():
+                    created, updated = _sync_single_transaction(db, transaction_data)
                 synced_count += 1
                 if created:
                     created_count += 1
@@ -158,7 +204,11 @@ async def sync_financial_job() -> Dict[str, Any]:
 
             except Exception as e:
                 error_count += 1
-                error_msg = f"Failed to sync transaction {transaction_data.get('id', 'unknown')}: {e}"
+                source_kind = _as_text(transaction_data.get("_sync_kind")) or "unknown"
+                transaction_id = _as_text(transaction_data.get("id")) or "unknown"
+                error_msg = (
+                    f"Failed to sync {source_kind} transaction {transaction_id}: {e}"
+                )
                 logger.error(error_msg)
                 errors.append(error_msg)
                 continue  # Continue with next transaction
@@ -166,22 +216,31 @@ async def sync_financial_job() -> Dict[str, Any]:
         # Step 4: Commit all changes
         db.commit()
 
-        duration = (datetime.utcnow() - start_time).total_seconds()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         logger.info(
             f"Financial data synchronization completed successfully: "
             f"{synced_count} synced ({created_count} created, {updated_count} updated), "
             f"{error_count} errors in {duration:.2f}s"
         )
+        total_errors = error_count + len(source_fetch_errors)
+        success = total_errors == 0
+        partial_success = synced_count > 0 and total_errors > 0
 
         return {
-            "success": True,
+            "success": success,
+            "partial_success": partial_success,
             "synced_count": synced_count,
             "created_count": created_count,
             "updated_count": updated_count,
-            "error_count": error_count,
-            "errors": errors,
+            "error_count": total_errors,
+            "errors": errors + source_fetch_errors,
+            "source_totals": source_totals,
+            "window": {
+                "data_vencimento_de": data_vencimento_de,
+                "data_vencimento_ate": data_vencimento_ate,
+            },
             "duration_seconds": duration,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
     except FinancialSyncAuthError as e:
@@ -236,7 +295,7 @@ async def _get_valid_conta_azul_token(db: Session) -> str:
 
             # Update token in database
             token_record.access_token = new_token_data["access_token"]
-            token_record.token_expiry = datetime.fromisoformat(
+            token_record.expires_at = datetime.fromisoformat(
                 new_token_data["expires_at"]
             )
             if "refresh_token" in new_token_data:
@@ -245,15 +304,20 @@ async def _get_valid_conta_azul_token(db: Session) -> str:
             db.commit()
             logger.info("Access token refreshed successfully")
 
+        except ContaAzulInvalidGrantError:
+            raise FinancialSyncAuthError(
+                "Refresh token inválido (invalid_grant). "
+                "Reautorize via GET /api/auth/conta-azul/authorize"
+            )
         except ContaAzulAuthError as e:
             raise FinancialSyncAuthError(f"Failed to refresh access token: {e}")
 
     return token_record.access_token
 
 
-async def _sync_single_transaction(
+def _sync_single_transaction(
     db: Session,
-    transaction_data: Dict[str, Any]
+    transaction_data: Dict[str, Any],
 ) -> Tuple[bool, bool]:
     """
     Synchronize a single financial transaction to the database.
@@ -288,89 +352,450 @@ async def _sync_single_transaction(
         FinancialSyncDataError: If required data is missing or invalid
         SQLAlchemyError: If database operation fails
     """
-    # Validate required fields
-    conta_azul_id = transaction_data.get("id")
-    if not conta_azul_id:
+    source_kind = _as_text(transaction_data.get("_sync_kind")) or "receber"
+    raw_event_id = _extract_event_id(transaction_data)
+    if not raw_event_id:
         raise FinancialSyncDataError("Transaction missing required 'id' field")
 
-    conta_azul_customer_id = transaction_data.get("customer_id")
-    if not conta_azul_customer_id:
-        raise FinancialSyncDataError(
-            f"Transaction {conta_azul_id} missing required 'customer_id' field"
-        )
+    person_info = _extract_person_info(transaction_data)
+    client = _resolve_or_create_client(
+        db=db,
+        person_info=person_info,
+        source_kind=source_kind,
+        event_id=raw_event_id,
+    )
 
-    # Find corresponding local client by conta_azul_id
-    client = db.query(Client).filter_by(
-        conta_azul_id=str(conta_azul_customer_id)
-    ).first()
+    total = _to_decimal(
+        transaction_data.get("valor")
+        or transaction_data.get("valor_total")
+        or transaction_data.get("amount")
+        or transaction_data.get("total")
+    )
+    not_paid = _to_decimal(transaction_data.get("nao_pago"))
+    paid = _to_decimal(transaction_data.get("pago"))
+    open_amount = not_paid if not_paid > 0 else max(total - paid, Decimal("0"))
+    amount = total if total > 0 else max(open_amount + paid, Decimal("0"))
 
-    if not client:
-        raise FinancialSyncDataError(
-            f"No local client found with conta_azul_id={conta_azul_customer_id}. "
-            "Run client sync first."
-        )
+    due_date = _parse_date(
+        transaction_data.get("data_vencimento") or transaction_data.get("due_date")
+    )
+    transaction_date = _parse_date(
+        transaction_data.get("data_emissao")
+        or transaction_data.get("data_lancamento")
+        or transaction_data.get("created_at")
+    ) or due_date or date.today()
+    payment_date = _parse_date(
+        transaction_data.get("data_pagamento") or transaction_data.get("paid_at")
+    )
 
-    # Check if record already exists
-    existing_record = db.query(FinancialRecord).filter_by(
-        conta_azul_id=str(conta_azul_id)
-    ).first()
+    status_raw = _as_text(
+        transaction_data.get("status_traduzido") or transaction_data.get("status")
+    ).upper()
+    status = _normalize_status(
+        status_raw=status_raw,
+        due_date=due_date,
+        payment_date=payment_date,
+        open_amount=open_amount,
+        paid_amount=paid,
+    )
+    days_overdue = _calculate_days_overdue(due_date=due_date, payment_date=payment_date)
 
-    # Parse transaction data
-    transaction_date = _parse_date(transaction_data.get("created_at"))
-    due_date = _parse_date(transaction_data.get("due_date"))
-    payment_date = _parse_date(transaction_data.get("paid_at"))
+    raw_number = _as_text(
+        transaction_data.get("numero")
+        or transaction_data.get("number")
+        or transaction_data.get("codigo")
+        or transaction_data.get("documento_numero")
+    )
+    transaction_number = _build_transaction_number(
+        source_kind=source_kind,
+        event_id=raw_event_id,
+        raw_number=raw_number,
+    )
 
-    # Calculate days overdue
-    days_overdue = 0
-    if due_date and not payment_date:
-        today = date.today()
-        if today > due_date:
-            days_overdue = (today - due_date).days
+    description = _as_text(
+        transaction_data.get("descricao")
+        or transaction_data.get("description")
+        or transaction_data.get("observacao")
+    ) or f"Conta a {'receber' if source_kind == 'receber' else 'pagar'}"
+    payment_method = _truncate(
+        transaction_data.get("forma_pagamento") or transaction_data.get("payment_method"),
+        50,
+    ) or None
+    currency = (_as_text(transaction_data.get("currency") or transaction_data.get("moeda")) or "BRL").upper()[:3]
 
-    # Determine transaction status
-    status = transaction_data.get("status", "pending").lower()
-    if days_overdue > 0 and status == "pending":
-        status = "overdue"
+    source_prefixed_id = _build_source_event_id(source_kind=source_kind, event_id=raw_event_id)
 
-    # Parse amount
-    amount = transaction_data.get("amount", 0)
-    if isinstance(amount, (int, float)):
-        amount = Decimal(str(amount))
-    elif isinstance(amount, str):
-        amount = Decimal(amount)
+    notes_chunks = []
+    if raw_number and raw_number != transaction_number:
+        notes_chunks.append(f"Numero original: {raw_number}")
+    if status_raw:
+        notes_chunks.append(f"Status original: {status_raw}")
+    notes_chunks.append(f"Fonte: contas a {source_kind}")
+    notes = " | ".join(notes_chunks)
 
-    # Prepare record data
     record_data = {
         "client_id": client.id,
-        "transaction_type": transaction_data.get("type", "invoice"),
-        "transaction_number": transaction_data.get("number", f"CA-{conta_azul_id}"),
-        "description": transaction_data.get("description", ""),
+        "transaction_type": "receivable" if source_kind == "receber" else "payable",
+        "transaction_number": transaction_number,
+        "description": _truncate(description, 10000),
         "amount": amount,
-        "currency": transaction_data.get("currency", "BRL"),
+        "currency": currency,
         "status": status,
-        "transaction_date": transaction_date or date.today(),
+        "transaction_date": transaction_date,
         "due_date": due_date,
         "payment_date": payment_date,
         "days_overdue": days_overdue,
-        "conta_azul_id": str(conta_azul_id),
-        "payment_method": transaction_data.get("payment_method"),
-        "notes": transaction_data.get("notes"),
-        "last_synced_at": datetime.utcnow()
+        "conta_azul_id": source_prefixed_id,
+        "payment_method": payment_method,
+        "notes": _truncate(notes, 10000),
+        "last_synced_at": datetime.now(timezone.utc),
     }
 
+    existing_record = db.query(FinancialRecord).filter_by(conta_azul_id=source_prefixed_id).first()
     if existing_record:
-        # Update existing record
         for key, value in record_data.items():
             setattr(existing_record, key, value)
-
         logger.debug(f"Updated financial record: {existing_record.transaction_number}")
         return (False, True)
-    else:
-        # Create new record
-        new_record = FinancialRecord(**record_data)
-        db.add(new_record)
-        logger.debug(f"Created financial record: {new_record.transaction_number}")
-        return (True, False)
+
+    new_record = FinancialRecord(**record_data)
+    db.add(new_record)
+    logger.debug(f"Created financial record: {new_record.transaction_number}")
+    return (True, False)
+
+
+def _build_sync_window() -> Tuple[str, str]:
+    """Build default due date window required by Conta Azul financial search API."""
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+    end_date = today + timedelta(days=DEFAULT_LOOKAHEAD_DAYS)
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _resolve_sync_window(
+    data_vencimento_de: Optional[str],
+    data_vencimento_ate: Optional[str],
+) -> Tuple[str, str]:
+    """
+    Resolve sync due-date window with validation.
+
+    If both values are missing, default rolling window is used.
+    If one value is provided, both become mandatory.
+    """
+    if not data_vencimento_de and not data_vencimento_ate:
+        return _build_sync_window()
+
+    if not data_vencimento_de or not data_vencimento_ate:
+        raise FinancialSyncDataError(
+            "data_vencimento_de e data_vencimento_ate devem ser informados juntos"
+        )
+
+    start_date = _parse_date(data_vencimento_de)
+    end_date = _parse_date(data_vencimento_ate)
+    if not start_date or not end_date:
+        raise FinancialSyncDataError(
+            "Periodo invalido. Use datas no formato YYYY-MM-DD."
+        )
+    if start_date > end_date:
+        raise FinancialSyncDataError("Data inicial maior que a data final.")
+
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _extract_items(response: Any) -> List[Dict[str, Any]]:
+    """Extract list-like payloads from heterogeneous Conta Azul responses."""
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        for key in ("data", "items", "content", "itens", "results", "contas"):
+            value = response.get(key)
+            if isinstance(value, list):
+                return value
+        if "id" in response:
+            return [response]
+    return []
+
+
+async def _fetch_financial_items_paginated(
+    service: ContaAzulService,
+    access_token: str,
+    endpoint: str,
+    data_vencimento_de: str,
+    data_vencimento_ate: str,
+    max_records: int,
+    page_size: int,
+) -> List[Dict[str, Any]]:
+    """Fetch all available pages from Conta Azul financial search endpoints."""
+    all_items: List[Dict[str, Any]] = []
+    page = 1
+    page_size = max(1, min(page_size, 100))
+    max_records = max(1, max_records)
+
+    while len(all_items) < max_records:
+        request_size = min(page_size, max_records - len(all_items))
+        params: Dict[str, Any] = {
+            "pagina": page,
+            "tamanho_pagina": request_size,
+            "data_vencimento_de": data_vencimento_de,
+            "data_vencimento_ate": data_vencimento_ate,
+        }
+        response = await service.make_api_request(
+            endpoint=endpoint,
+            access_token=access_token,
+            method="GET",
+            params=params,
+        )
+        items = service._extract_items(response) if hasattr(service, "_extract_items") else _extract_items(response)
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < request_size:
+            break
+        page += 1
+
+    return all_items
+
+
+def _extract_event_id(transaction_data: Dict[str, Any]) -> str:
+    """Extract stable Conta Azul event id from heterogeneous payloads."""
+    for key in ("id", "evento_financeiro_id", "event_id", "codigo"):
+        value = transaction_data.get(key)
+        text = _as_text(value)
+        if text:
+            return _truncate(text, 80)
+    return ""
+
+
+def _build_source_event_id(source_kind: str, event_id: str) -> str:
+    """Build source-prefixed unique id persisted in financial_records.conta_azul_id."""
+    return _truncate(f"{source_kind}:{event_id}", 100)
+
+
+def _build_transaction_number(source_kind: str, event_id: str, raw_number: str) -> str:
+    """Build deterministic transaction number that satisfies unique constraints."""
+    base = _as_text(raw_number) or event_id
+    prefix = "REC" if source_kind == "receber" else "PAG"
+    return _truncate(f"CA-{prefix}-{base}", 100)
+
+
+def _extract_person_info(transaction_data: Dict[str, Any]) -> Dict[str, str]:
+    """Normalize counterparty fields from mixed Conta Azul payloads."""
+    info: Dict[str, str] = {
+        "id": "",
+        "name": "",
+        "document": "",
+        "email": "",
+        "phone": "",
+    }
+
+    person = (
+        transaction_data.get("pessoa")
+        or transaction_data.get("cliente")
+        or transaction_data.get("fornecedor")
+        or {}
+    )
+    if isinstance(person, dict):
+        info["id"] = _as_text(person.get("id") or person.get("pessoa_id") or person.get("codigo"))
+        info["name"] = _as_text(
+            person.get("nome")
+            or person.get("razao_social")
+            or person.get("nome_fantasia")
+        )
+        info["document"] = _as_text(
+            person.get("cpf")
+            or person.get("cnpj")
+            or person.get("cpf_cnpj")
+            or person.get("documento")
+            or person.get("document")
+        )
+        info["email"] = _as_text(person.get("email"))
+        info["phone"] = _as_text(person.get("telefone") or person.get("celular"))
+    elif isinstance(person, str):
+        info["name"] = _as_text(person)
+
+    if not info["id"]:
+        info["id"] = _as_text(
+            transaction_data.get("pessoa_id")
+            or transaction_data.get("cliente_id")
+            or transaction_data.get("fornecedor_id")
+            or transaction_data.get("customer_id")
+            or transaction_data.get("supplier_id")
+        )
+    if not info["name"]:
+        info["name"] = _as_text(
+            transaction_data.get("nome_pessoa")
+            or transaction_data.get("cliente")
+            or transaction_data.get("fornecedor")
+        )
+    if not info["document"]:
+        info["document"] = _as_text(
+            transaction_data.get("cpf")
+            or transaction_data.get("cnpj")
+            or transaction_data.get("cpf_cnpj")
+            or transaction_data.get("documento")
+            or transaction_data.get("document")
+        )
+    if not info["email"]:
+        info["email"] = _as_text(transaction_data.get("email"))
+    if not info["phone"]:
+        info["phone"] = _as_text(
+            transaction_data.get("telefone")
+            or transaction_data.get("celular")
+            or transaction_data.get("phone")
+        )
+
+    return info
+
+
+def _resolve_or_create_client(
+    db: Session,
+    person_info: Dict[str, str],
+    source_kind: str,
+    event_id: str,
+) -> Client:
+    """Resolve local client from payload fields or create deterministic placeholder."""
+    person_id = _truncate(person_info.get("id"), 100)
+    raw_name = _truncate(person_info.get("name"), 255)
+    fallback_seed = f"{source_kind}:{person_id or raw_name.lower() or event_id}"
+    normalized_tax_id = _normalize_tax_id(person_info.get("document"), fallback_seed)
+    normalized_email = _truncate(person_info.get("email"), 255)
+    normalized_phone = _truncate(person_info.get("phone"), 20)
+    display_name = raw_name or f"{'Cliente' if source_kind == 'receber' else 'Fornecedor'} {event_id}"
+
+    client: Optional[Client] = None
+    if person_id:
+        client = db.query(Client).filter_by(conta_azul_id=person_id).first()
+    if not client and normalized_tax_id:
+        client = db.query(Client).filter_by(cpf_cnpj=normalized_tax_id).first()
+    if not client and normalized_email:
+        client = db.query(Client).filter_by(email=normalized_email).first()
+    if not client and display_name:
+        client = db.query(Client).filter_by(name=display_name).first()
+
+    now = datetime.now(timezone.utc)
+
+    if client:
+        if person_id and not client.conta_azul_id:
+            client.conta_azul_id = person_id
+        if normalized_email and not client.email:
+            client.email = normalized_email
+        if normalized_phone and not client.phone:
+            client.phone = normalized_phone
+        client.last_synced_at = now
+        return client
+
+    generated_conta_azul_id = person_id or _truncate(
+        f"{source_kind}-person-{hashlib.sha1(fallback_seed.encode('utf-8')).hexdigest()[:24]}",
+        100,
+    )
+    new_client = Client(
+        name=display_name,
+        email=normalized_email or None,
+        phone=normalized_phone or None,
+        cpf_cnpj=normalized_tax_id,
+        conta_azul_id=generated_conta_azul_id,
+        notes=f"Criado automaticamente pelo sync financeiro ({source_kind})",
+        last_synced_at=now,
+    )
+    db.add(new_client)
+    db.flush()  # Ensures new_client.id is available for FK usage
+    return new_client
+
+
+def _normalize_status(
+    status_raw: str,
+    due_date: Optional[date],
+    payment_date: Optional[date],
+    open_amount: Decimal,
+    paid_amount: Decimal,
+) -> str:
+    """Map Conta Azul status variants to local normalized status values."""
+    if status_raw in CANCELED_STATUSES:
+        return "cancelled"
+
+    if status_raw in PAID_STATUSES or payment_date or (open_amount <= 0 and paid_amount > 0):
+        return "paid"
+
+    if due_date and due_date < date.today():
+        return "overdue"
+
+    return "pending"
+
+
+def _calculate_days_overdue(
+    due_date: Optional[date],
+    payment_date: Optional[date],
+) -> int:
+    """Calculate days overdue for open transactions."""
+    if not due_date or payment_date:
+        return 0
+    today = date.today()
+    if today <= due_date:
+        return 0
+    return (today - due_date).days
+
+
+def _as_text(value: Any) -> str:
+    """Convert arbitrary values to stripped text safely."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _truncate(value: Any, max_len: int) -> str:
+    """Convert value to string and enforce max length for DB compatibility."""
+    return _as_text(value)[:max_len]
+
+
+def _to_decimal(value: Any) -> Decimal:
+    """Convert value to Decimal with safe fallbacks for malformed payloads."""
+    if value is None or value == "":
+        return Decimal("0")
+
+    if isinstance(value, Decimal):
+        return value
+
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+
+    text = _as_text(value).replace("R$", "").replace(" ", "")
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text and "." not in text:
+        text = text.replace(",", ".")
+
+    try:
+        return Decimal(text)
+    except Exception:
+        logger.warning(f"Failed to parse decimal value: {value}")
+        return Decimal("0")
+
+
+def _normalize_tax_id(raw_value: Any, fallback_seed: str) -> str:
+    """
+    Normalize CPF/CNPJ/document value to fit Client.cpf_cnpj (varchar(20)).
+
+    Preference order:
+    1) Valid CPF/CNPJ digits (11/14)
+    2) Digits-only version up to 20 chars
+    3) Sanitized alphanumeric document up to 20 chars
+    4) Deterministic placeholder from fallback seed (always <=20)
+    """
+    raw = _truncate(raw_value, 255)
+    digits = "".join(ch for ch in raw if ch.isdigit())
+
+    if len(digits) in (11, 14):
+        return digits
+
+    if digits and len(digits) <= 20:
+        return digits
+
+    cleaned = re.sub(r"[^A-Za-z0-9._/-]", "", raw)
+    if cleaned:
+        return cleaned[:20]
+
+    digest = hashlib.sha1(fallback_seed.encode("utf-8")).hexdigest()[:17]
+    return f"CA-{digest}"
 
 
 def _parse_date(date_value: Any) -> Optional[date]:
@@ -391,23 +816,76 @@ def _parse_date(date_value: Any) -> Optional[date]:
     if not date_value:
         return None
 
+    if isinstance(date_value, datetime):
+        return date_value.date()
     if isinstance(date_value, date):
         return date_value
 
-    if isinstance(date_value, datetime):
-        return date_value.date()
-
     if isinstance(date_value, str):
+        text = date_value.strip()
+        if not text:
+            return None
+
+        date_token = text[:10]
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(date_token, fmt).date()
+            except ValueError:
+                continue
+
         try:
-            # Try parsing ISO datetime format
-            if "T" in date_value:
-                dt = datetime.fromisoformat(date_value.replace("Z", "+00:00"))
-                return dt.date()
-            else:
-                # Try parsing ISO date format
-                return datetime.strptime(date_value, "%Y-%m-%d").date()
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
         except ValueError:
             logger.warning(f"Failed to parse date value: {date_value}")
             return None
 
     return None
+
+
+async def get_financial_sync_status() -> Dict[str, Any]:
+    """
+    Get current financial synchronization status and aggregate counters.
+
+    Returns:
+        Dict containing:
+            - total_records: total financial records in database
+            - synced_records: records with Conta Azul linkage and sync timestamp
+            - receivable_records: total records of type receivable
+            - payable_records: total records of type payable
+            - overdue_records: total records currently marked overdue
+            - last_sync_time: most recent last_synced_at timestamp (or None)
+            - timestamp: status generation timestamp
+    """
+    db: Session = SessionLocal()
+    try:
+        total_records = db.query(FinancialRecord).count()
+        synced_records = db.query(FinancialRecord).filter(
+            FinancialRecord.conta_azul_id.isnot(None),
+            FinancialRecord.last_synced_at.isnot(None),
+        ).count()
+        receivable_records = db.query(FinancialRecord).filter(
+            FinancialRecord.transaction_type == "receivable"
+        ).count()
+        payable_records = db.query(FinancialRecord).filter(
+            FinancialRecord.transaction_type == "payable"
+        ).count()
+        overdue_records = db.query(FinancialRecord).filter(
+            FinancialRecord.status == "overdue"
+        ).count()
+
+        last_synced = db.query(FinancialRecord).filter(
+            FinancialRecord.last_synced_at.isnot(None)
+        ).order_by(FinancialRecord.last_synced_at.desc()).first()
+        last_sync_time = last_synced.last_synced_at.isoformat() if last_synced else None
+
+        return {
+            "total_records": total_records,
+            "synced_records": synced_records,
+            "receivable_records": receivable_records,
+            "payable_records": payable_records,
+            "overdue_records": overdue_records,
+            "last_sync_time": last_sync_time,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    finally:
+        db.close()

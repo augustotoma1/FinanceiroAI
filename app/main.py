@@ -17,15 +17,36 @@ Background jobs run automatically on schedule:
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
-from app.background import sync_clients_job, sync_financial_job
+from app.background import (
+    daily_ai_employee_job,
+    daily_contract_lifecycle_job,
+    daily_billing_email_job,
+    daily_whatsapp_billing_job,
+    sync_clients_job,
+    sync_financial_job,
+    sync_signatures_job,
+)
+from app.services.telegram_bot import (
+    send_contract_lifecycle_alert,
+    create_bot_application,
+    send_ai_employee_alert,
+    send_daily_cfo_alert,
+    send_daily_email_billing_alert,
+    send_weekly_cfo_alert,
+    start_bot,
+    stop_bot,
+)
+from app.services.cash_risk_service import persist_daily_cash_risk_snapshot
+from app.api.dependencies import verify_api_key
 
 # Configure logging
 logging.basicConfig(
@@ -53,6 +74,17 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize and start scheduler
     logger.info("Starting application and background job scheduler...")
 
+    # Initialize Telegram bot (skip during tests to avoid 429 errors)
+    is_testing = os.environ.get("TESTING") == "1"
+    telegram_app = None if is_testing else create_bot_application()
+
+    # In test mode, skip scheduler jobs entirely to avoid background side
+    # effects (DB writes/races) that make API tests flaky.
+    if is_testing:
+        logger.info("TESTING=1 detected: skipping scheduler and Telegram startup")
+        yield
+        return
+
     try:
         # Schedule client synchronization job - runs every hour
         scheduler.add_job(
@@ -76,6 +108,240 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Scheduled financial data synchronization job (daily at 2:00 AM)")
 
+        if settings.AUTENTIQUE_SIGNATURE_SYNC_ENABLED:
+            signature_interval = max(
+                5, int(getattr(settings, "AUTENTIQUE_SIGNATURE_SYNC_INTERVAL_MINUTES", 30))
+            )
+            scheduler.add_job(
+                func=sync_signatures_job,
+                trigger=IntervalTrigger(minutes=signature_interval),
+                id="sync_signatures",
+                name="Sync Autentique signatures",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled Autentique signature sync job (every %s minutes, max_contracts=%s, only_open=%s)",
+                signature_interval,
+                settings.AUTENTIQUE_SIGNATURE_SYNC_MAX_CONTRACTS,
+                settings.AUTENTIQUE_SIGNATURE_SYNC_ONLY_OPEN,
+            )
+
+        # Schedule daily cash-risk snapshot persistence (5 minutes before CFO alert)
+        snapshot_hour = settings.TELEGRAM_ALERT_HOUR
+        snapshot_minute = settings.TELEGRAM_ALERT_MINUTE - 5
+        if snapshot_minute < 0:
+            snapshot_minute += 60
+            snapshot_hour = (snapshot_hour - 1) % 24
+
+        scheduler.add_job(
+            func=persist_daily_cash_risk_snapshot,
+            trigger=CronTrigger(hour=snapshot_hour, minute=snapshot_minute),
+            id='daily_cash_risk_snapshot',
+            name='Persist daily cash risk snapshot',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        logger.info(
+            "Scheduled daily cash risk snapshot (%02d:%02d)",
+            snapshot_hour,
+            snapshot_minute,
+        )
+
+        if settings.CONTRACT_LIFECYCLE_ENABLED:
+            scheduler.add_job(
+                func=daily_contract_lifecycle_job,
+                trigger=CronTrigger(
+                    hour=settings.CONTRACT_LIFECYCLE_RUN_HOUR,
+                    minute=settings.CONTRACT_LIFECYCLE_RUN_MINUTE,
+                ),
+                id="daily_contract_lifecycle",
+                name="Contract lifecycle daily maintenance",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled contract lifecycle maintenance (%02d:%02d) window=%sd",
+                settings.CONTRACT_LIFECYCLE_RUN_HOUR,
+                settings.CONTRACT_LIFECYCLE_RUN_MINUTE,
+                settings.CONTRACT_LIFECYCLE_ALERT_DAYS,
+            )
+
+        if telegram_app:
+            async def daily_cfo_alert_job():
+                await send_daily_cfo_alert(telegram_app)
+
+            scheduler.add_job(
+                func=daily_cfo_alert_job,
+                trigger=CronTrigger(
+                    hour=settings.TELEGRAM_ALERT_HOUR,
+                    minute=settings.TELEGRAM_ALERT_MINUTE,
+                ),
+                id='daily_cfo_alert',
+                name='Send daily CFO alert on Telegram',
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled daily CFO Telegram alert (%02d:%02d)",
+                settings.TELEGRAM_ALERT_HOUR,
+                settings.TELEGRAM_ALERT_MINUTE,
+            )
+
+            if settings.TELEGRAM_WEEKLY_ALERT_ENABLED:
+                async def weekly_cfo_alert_job():
+                    await send_weekly_cfo_alert(telegram_app)
+
+                scheduler.add_job(
+                    func=weekly_cfo_alert_job,
+                    trigger=CronTrigger(
+                        day_of_week=settings.TELEGRAM_WEEKLY_ALERT_DAY,
+                        hour=settings.TELEGRAM_WEEKLY_ALERT_HOUR,
+                        minute=settings.TELEGRAM_WEEKLY_ALERT_MINUTE,
+                    ),
+                    id='weekly_cfo_alert',
+                    name='Send weekly CFO summary on Telegram',
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=1800,
+                )
+                logger.info(
+                    "Scheduled weekly CFO Telegram summary (%s %02d:%02d)",
+                    settings.TELEGRAM_WEEKLY_ALERT_DAY,
+                    settings.TELEGRAM_WEEKLY_ALERT_HOUR,
+                    settings.TELEGRAM_WEEKLY_ALERT_MINUTE,
+                )
+
+            if settings.CONTRACT_LIFECYCLE_ENABLED and settings.CONTRACT_LIFECYCLE_ALERT_ENABLED:
+                async def daily_contract_lifecycle_alert_job():
+                    await send_contract_lifecycle_alert(telegram_app)
+
+                scheduler.add_job(
+                    func=daily_contract_lifecycle_alert_job,
+                    trigger=CronTrigger(
+                        hour=settings.CONTRACT_LIFECYCLE_ALERT_HOUR,
+                        minute=settings.CONTRACT_LIFECYCLE_ALERT_MINUTE,
+                    ),
+                    id="daily_contract_lifecycle_alert",
+                    name="Send daily contract lifecycle alert on Telegram",
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=1800,
+                )
+                logger.info(
+                    "Scheduled contract lifecycle Telegram alert (%02d:%02d)",
+                    settings.CONTRACT_LIFECYCLE_ALERT_HOUR,
+                    settings.CONTRACT_LIFECYCLE_ALERT_MINUTE,
+                )
+
+        if settings.EMAIL_BILLING_ENABLED:
+            billing_job_func = daily_billing_email_job
+            billing_job_name = "Send daily billing reminder emails"
+            if telegram_app:
+                async def daily_billing_email_job_with_alert():
+                    result = await daily_billing_email_job()
+                    if bool(getattr(settings, "EMAIL_BILLING_ALERT_ENABLED", True)):
+                        await send_daily_email_billing_alert(telegram_app, result)
+                    return result
+
+                billing_job_func = daily_billing_email_job_with_alert
+                billing_job_name = "Send daily billing reminder emails + Telegram alert"
+
+            scheduler.add_job(
+                func=billing_job_func,
+                trigger=CronTrigger(
+                    hour=settings.EMAIL_BILLING_HOUR,
+                    minute=settings.EMAIL_BILLING_MINUTE,
+                ),
+                id="daily_billing_email",
+                name=billing_job_name,
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled billing email campaign (%02d:%02d) provider=%s dry_run=%s telegram_alert=%s",
+                settings.EMAIL_BILLING_HOUR,
+                settings.EMAIL_BILLING_MINUTE,
+                settings.EMAIL_BILLING_PROVIDER,
+                settings.EMAIL_BILLING_DRY_RUN,
+                getattr(settings, "EMAIL_BILLING_ALERT_ENABLED", True),
+            )
+
+        if settings.WHATSAPP_FEATURE_ENABLED and settings.WHATSAPP_BILLING_ENABLED:
+            scheduler.add_job(
+                func=daily_whatsapp_billing_job,
+                trigger=CronTrigger(
+                    hour=settings.WHATSAPP_BILLING_HOUR,
+                    minute=settings.WHATSAPP_BILLING_MINUTE,
+                ),
+                id="daily_whatsapp_billing",
+                name="Send daily WhatsApp billing reminders",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled WhatsApp billing campaign (%02d:%02d) provider=%s dry_run=%s require_confirmation=%s",
+                settings.WHATSAPP_BILLING_HOUR,
+                settings.WHATSAPP_BILLING_MINUTE,
+                settings.WHATSAPP_BILLING_PROVIDER,
+                settings.WHATSAPP_BILLING_DRY_RUN,
+                getattr(settings, "WHATSAPP_BILLING_REQUIRE_CONFIRMATION", True),
+            )
+        elif settings.WHATSAPP_BILLING_ENABLED and not settings.WHATSAPP_FEATURE_ENABLED:
+            logger.info(
+                "WhatsApp billing configured but skipped: WHATSAPP_FEATURE_ENABLED=false (phase disabled)."
+            )
+
+        if settings.AI_EMPLOYEE_ENABLED and settings.AI_EMPLOYEE_DAILY_SUMMARY_ENABLED:
+            ai_employee_job_func = daily_ai_employee_job
+            if telegram_app and bool(getattr(settings, "AI_EMPLOYEE_TELEGRAM_ALERT_ENABLED", True)):
+                async def daily_ai_employee_job_with_alert():
+                    result = await daily_ai_employee_job()
+                    await send_ai_employee_alert(telegram_app, result)
+                    return result
+
+                ai_employee_job_func = daily_ai_employee_job_with_alert
+
+            scheduler.add_job(
+                func=ai_employee_job_func,
+                trigger=CronTrigger(
+                    hour=int(getattr(settings, "AI_EMPLOYEE_DAILY_HOUR", 8)),
+                    minute=int(getattr(settings, "AI_EMPLOYEE_DAILY_MINUTE", 20)),
+                ),
+                id="daily_ai_employee",
+                name="Run AI Employee daily orchestration",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled AI Employee orchestration (%02d:%02d) engine=%s dry_run=%s telegram_alert=%s",
+                int(getattr(settings, "AI_EMPLOYEE_DAILY_HOUR", 8)),
+                int(getattr(settings, "AI_EMPLOYEE_DAILY_MINUTE", 20)),
+                getattr(settings, "AI_EMPLOYEE_ORCHESTRATION_ENGINE", "builtin"),
+                getattr(settings, "AI_EMPLOYEE_DRY_RUN", True),
+                bool(getattr(settings, "AI_EMPLOYEE_TELEGRAM_ALERT_ENABLED", True)),
+            )
+        elif settings.AI_EMPLOYEE_ENABLED:
+            logger.info(
+                "AI Employee enabled in manual mode (daily summary scheduler disabled)."
+            )
+
         # Start the scheduler
         scheduler.start()
         logger.info("Background job scheduler started successfully")
@@ -84,7 +350,24 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start scheduler: {e}", exc_info=True)
         raise
 
+    # Start Telegram bot if configured
+    if telegram_app:
+        try:
+            await start_bot(telegram_app)
+            logger.info("Telegram bot is running")
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot: {e}")
+            telegram_app = None
+
     yield  # Application runs here
+
+    # Shutdown: Stop Telegram bot
+    if telegram_app:
+        try:
+            await stop_bot(telegram_app)
+            logger.info("Telegram bot stopped")
+        except Exception as e:
+            logger.error(f"Error stopping Telegram bot: {e}")
 
     # Shutdown: Stop scheduler gracefully
     logger.info("Shutting down background job scheduler...")
@@ -150,9 +433,9 @@ async def root():
 from app.api import conversation, clients, contracts, signatures, auth, dashboard
 
 # Include routers with prefixes and tags
-app.include_router(conversation.router, prefix="/api/conversation", tags=["conversation"])
-app.include_router(clients.router, prefix="/api/clients", tags=["clients"])
-app.include_router(contracts.router, prefix="/api/contracts", tags=["contracts"])
-app.include_router(signatures.router, prefix="/api/signatures", tags=["signatures"])
+app.include_router(conversation.router, prefix="/api/conversation", tags=["conversation"], dependencies=[Depends(verify_api_key)])
+app.include_router(clients.router, prefix="/api/clients", tags=["clients"], dependencies=[Depends(verify_api_key)])
+app.include_router(contracts.router, prefix="/api/contracts", tags=["contracts"], dependencies=[Depends(verify_api_key)])
+app.include_router(signatures.router, prefix="/api/signatures", tags=["signatures"], dependencies=[Depends(verify_api_key)])
 app.include_router(auth.router, prefix="/api/auth", tags=["authentication"])
-app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"], dependencies=[Depends(verify_api_key)])

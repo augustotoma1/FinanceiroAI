@@ -24,11 +24,19 @@ requests-toolbelt>=1.0.0
 # PDF Generation
 weasyprint>=60.0
 
+# Telegram Bot
+python-telegram-bot>=21.0
+
 # Background Jobs
 apscheduler>=3.10.0
 
 # Templating
 jinja2>=3.1.0
+
+# AI Employee orchestration stack
+langgraph>=0.2.0
+# CrewAI remains optional and may require a separate compatible Python runtime.
+# crewai>=0.100.0
 
 # Testing (optional but recommended)
 pytest>=8.0.0
