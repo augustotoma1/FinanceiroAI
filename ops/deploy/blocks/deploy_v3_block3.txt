@@ -1,0 +1,1 @@
+python3 -c "import zlib;open('/tmp/deploy_v3.py','wb').write(zlib.decompress(bytes.fromhex(open('/tmp/deploy_v3.hex').read().replace(chr(10),''))))" && python3 /tmp/deploy_v3.py

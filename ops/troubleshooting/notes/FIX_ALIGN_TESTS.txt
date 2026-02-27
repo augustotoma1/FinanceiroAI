@@ -1,0 +1,591 @@
+## P2 #8 — Alinhar testes com as mudanças do código
+## Corrige:
+##   1. test_claude.py: Anthropic → AsyncAnthropic + Mock → AsyncMock
+##   2. test_endpoints.py: ClaudeService → _get_claude_service singleton + AsyncMock
+##   3. conftest.py: Override auth dependency se existir
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+# Backups
+cp /opt/agent-financeiro-aisatec/tests/test_services/test_claude.py /opt/agent-financeiro-aisatec/tests/test_services/test_claude.py.bak_pre_align
+cp /opt/agent-financeiro-aisatec/tests/test_api/test_endpoints.py /opt/agent-financeiro-aisatec/tests/test_api/test_endpoints.py.bak_pre_align
+cp /opt/agent-financeiro-aisatec/tests/conftest.py /opt/agent-financeiro-aisatec/tests/conftest.py.bak_pre_align
+
+python3 << 'PYEOF'
+import re
+
+total_changes = 0
+
+# ======================================================
+# FIX 1: test_claude.py
+# ======================================================
+path1 = "/opt/agent-financeiro-aisatec/tests/test_services/test_claude.py"
+
+with open(path1, "r") as f:
+    c1 = f.read()
+
+ch1 = 0
+
+# 1a: Add AsyncMock to import
+old = "from unittest.mock import Mock, patch, MagicMock"
+new = "from unittest.mock import Mock, AsyncMock, patch, MagicMock"
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    ch1 += 1
+    print("OK 1a: AsyncMock adicionado ao import")
+else:
+    if "AsyncMock" in c1:
+        print("SKIP 1a: AsyncMock ja importado")
+    else:
+        print("WARN 1a: import nao encontrado")
+
+# 1b: Replace all Anthropic patches with AsyncAnthropic (4 locations)
+old_patch = "patch('app.services.claude_service.Anthropic')"
+new_patch = "patch('app.services.claude_service.AsyncAnthropic')"
+count_patches = c1.count(old_patch)
+if count_patches > 0:
+    c1 = c1.replace(old_patch, new_patch)
+    ch1 += count_patches
+    print(f"OK 1b: {count_patches}x Anthropic -> AsyncAnthropic nos patches")
+else:
+    print("WARN 1b: patches Anthropic nao encontrados")
+
+# 1c: assert_called_once_with Anthropic -> AsyncAnthropic
+old_assert = "mock_anthropic.assert_called_once_with(api_key=settings.ANTHROPIC_API_KEY)"
+new_assert = "mock_anthropic.assert_called_once_with(api_key=settings.ANTHROPIC_API_KEY)"
+# Keep the same - the variable name stays mock_anthropic, just the target changes
+# Actually this line is fine - it asserts the mock (which is now AsyncAnthropic) was called
+
+# 1d: Replace Mock(return_value=mock_response) with AsyncMock for messages.create
+# Pattern: service.client.messages.create = Mock(return_value=mock_response)
+old_mock_rv = "service.client.messages.create = Mock(return_value=mock_response)"
+new_mock_rv = "service.client.messages.create = AsyncMock(return_value=mock_response)"
+count_rv = c1.count(old_mock_rv)
+if count_rv > 0:
+    c1 = c1.replace(old_mock_rv, new_mock_rv)
+    ch1 += count_rv
+    print(f"OK 1d: {count_rv}x Mock(return_value) -> AsyncMock(return_value)")
+else:
+    print("WARN 1d: Mock(return_value=mock_response) nao encontrado")
+
+# 1e: Replace Mock(side_effect=...) with AsyncMock for messages.create
+# Multiple patterns for side_effect
+side_effect_patterns = [
+    ('service.client.messages.create = Mock(side_effect=RateLimitError("Rate limit exceeded"))',
+     'service.client.messages.create = AsyncMock(side_effect=RateLimitError("Rate limit exceeded"))'),
+    ('service.client.messages.create = Mock(side_effect=APIConnectionError("Connection failed"))',
+     'service.client.messages.create = AsyncMock(side_effect=APIConnectionError("Connection failed"))'),
+    ('service.client.messages.create = Mock(side_effect=APIError("API error"))',
+     'service.client.messages.create = AsyncMock(side_effect=APIError("API error"))'),
+    ('service.client.messages.create = Mock(side_effect=Exception("Unexpected error"))',
+     'service.client.messages.create = AsyncMock(side_effect=Exception("Unexpected error"))'),
+    ('service.client.messages.create = Mock(side_effect=Exception("Unexpected"))',
+     'service.client.messages.create = AsyncMock(side_effect=Exception("Unexpected"))'),
+    ('service.client.messages.create = Mock(side_effect=APIConnectionError("Connection failed"))',
+     'service.client.messages.create = AsyncMock(side_effect=APIConnectionError("Connection failed"))'),
+    ('service.client.messages.create = Mock(side_effect=RateLimitError("Rate limit"))',
+     'service.client.messages.create = AsyncMock(side_effect=RateLimitError("Rate limit"))'),
+]
+
+for old_se, new_se in side_effect_patterns:
+    if old_se in c1:
+        c1 = c1.replace(old_se, new_se)
+        ch1 += 1
+        short = old_se.split("side_effect=")[1][:30]
+        print(f"OK 1e: side_effect {short}... -> AsyncMock")
+
+# 1f: Catch-all for any remaining Mock on messages.create
+# Use regex to catch any remaining patterns
+remaining = re.findall(r'service\.client\.messages\.create\s*=\s*Mock\(', c1)
+if remaining:
+    c1 = re.sub(
+        r'service\.client\.messages\.create\s*=\s*Mock\(',
+        'service.client.messages.create = AsyncMock(',
+        c1
+    )
+    ch1 += len(remaining)
+    print(f"OK 1f: {len(remaining)}x remaining Mock -> AsyncMock (catch-all)")
+
+with open(path1, "w") as f:
+    f.write(c1)
+
+print(f"\ntest_claude.py: {ch1} alteracoes\n")
+total_changes += ch1
+
+
+# ======================================================
+# FIX 2: test_endpoints.py
+# ======================================================
+path2 = "/opt/agent-financeiro-aisatec/tests/test_api/test_endpoints.py"
+
+with open(path2, "r") as f:
+    c2 = f.read()
+
+ch2 = 0
+
+# 2a: Add AsyncMock to import
+old = "from unittest.mock import patch, Mock, MagicMock"
+new = "from unittest.mock import patch, Mock, AsyncMock, MagicMock"
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    ch2 += 1
+    print("OK 2a: AsyncMock adicionado ao import")
+else:
+    if "AsyncMock" in c2:
+        print("SKIP 2a: AsyncMock ja importado")
+    else:
+        print("WARN 2a: import nao encontrado")
+
+# 2b: Replace conversation test mocking pattern
+# Old pattern uses ClaudeService constructor, new uses _get_claude_service singleton
+# Also fix send_message to return string (not dict) + use AsyncMock
+
+# Pattern 1: start_conversation with send_message returning dict
+old_start = """    def test_start_conversation_success(self, client):
+        \"\"\"Test starting a new conversation returns conversation ID and greeting\"\"\"
+        # Mock Claude service
+        with patch('app.api.conversation.ClaudeService') as mock_claude:
+            mock_service = Mock()
+            mock_service.send_message.return_value = {
+                "message": "Hello! I'll help you create a service contract."
+            }
+            mock_claude.return_value = mock_service
+
+            response = client.post("/api/conversation/start")
+
+            assert response.status_code == 201
+            data = response.json()
+            assert "conversation_id" in data
+            assert "message" in data
+            assert "created_at" in data
+            assert data["message"] == "Hello! I'll help you create a service contract.\""""
+
+new_start = """    def test_start_conversation_success(self, client):
+        \"\"\"Test starting a new conversation returns conversation ID and greeting\"\"\"
+        # Mock Claude service singleton
+        with patch('app.api.conversation._get_claude_service') as mock_get_service, \\
+             patch('app.api.conversation._claude_service', None):
+            mock_service = Mock()
+            mock_service.send_message = AsyncMock(
+                return_value="Hello! I'll help you create a service contract."
+            )
+            mock_get_service.return_value = mock_service
+
+            response = client.post("/api/conversation/start")
+
+            assert response.status_code == 201
+            data = response.json()
+            assert "conversation_id" in data
+            assert "message" in data
+            assert "created_at" in data
+            assert data["message"] == "Hello! I'll help you create a service contract.\""""
+
+if old_start in c2:
+    c2 = c2.replace(old_start, new_start, 1)
+    ch2 += 1
+    print("OK 2b: test_start_conversation_success corrigido")
+else:
+    print("WARN 2b: test_start_conversation_success pattern nao encontrado")
+
+
+# Pattern 2: test_send_message_success (complex - start + message)
+old_send = """    def test_send_message_success(self, client):
+        \"\"\"Test sending a message in an existing conversation\"\"\"
+        # First, start a conversation
+        with patch('app.api.conversation.ClaudeService') as mock_claude:
+            mock_service = Mock()
+            mock_service.send_message.return_value = {
+                "message": "Hello! I'll help you create a service contract."
+            }
+            mock_claude.return_value = mock_service
+
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]
+
+            # Mock continuing conversation
+            mock_service.collect_contract_data.return_value = {
+                "complete": False,
+                "message": "Great! What's the client's CPF or CNPJ?"
+            }
+
+            # Send a message
+            message_response = client.post(
+                f"/api/conversation/{conversation_id}/message",
+                json={"message": "The client name is João Silva"}
+            )
+
+            assert message_response.status_code == 200
+            data = message_response.json()
+            assert data["conversation_id"] == conversation_id
+            assert data["user_message"] == "The client name is João Silva"
+            assert "assistant_message" in data
+            assert data["complete"] is False
+            assert "timestamp" in data"""
+
+new_send = """    def test_send_message_success(self, client):
+        \"\"\"Test sending a message in an existing conversation\"\"\"
+        # First, start a conversation
+        with patch('app.api.conversation._get_claude_service') as mock_get_service, \\
+             patch('app.api.conversation._claude_service', None):
+            mock_service = Mock()
+            mock_service.send_message = AsyncMock(
+                return_value="Hello! I'll help you create a service contract."
+            )
+            mock_get_service.return_value = mock_service
+
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]
+
+            # Mock continuing conversation
+            mock_service.collect_contract_data = AsyncMock(return_value={
+                "complete": False,
+                "message": "Great! What's the client's CPF or CNPJ?"
+            })
+
+            # Send a message
+            message_response = client.post(
+                f"/api/conversation/{conversation_id}/message",
+                json={"message": "The client name is João Silva"}
+            )
+
+            assert message_response.status_code == 200
+            data = message_response.json()
+            assert data["conversation_id"] == conversation_id
+            assert data["user_message"] == "The client name is João Silva"
+            assert "assistant_message" in data
+            assert data["complete"] is False
+            assert "timestamp" in data"""
+
+if old_send in c2:
+    c2 = c2.replace(old_send, new_send, 1)
+    ch2 += 1
+    print("OK 2c: test_send_message_success corrigido")
+else:
+    print("WARN 2c: test_send_message_success pattern nao encontrado")
+
+
+# Pattern 3: test_send_message_empty_message
+old_empty = """    def test_send_message_empty_message(self, client):
+        \"\"\"Test sending empty message returns validation error\"\"\"
+        with patch('app.api.conversation.ClaudeService'):
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]"""
+
+new_empty = """    def test_send_message_empty_message(self, client):
+        \"\"\"Test sending empty message returns validation error\"\"\"
+        with patch('app.api.conversation._get_claude_service') as mock_get_service, \\
+             patch('app.api.conversation._claude_service', None):
+            mock_service = Mock()
+            mock_service.send_message = AsyncMock(return_value="Hello!")
+            mock_get_service.return_value = mock_service
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]"""
+
+if old_empty in c2:
+    c2 = c2.replace(old_empty, new_empty, 1)
+    ch2 += 1
+    print("OK 2d: test_send_message_empty_message corrigido")
+else:
+    print("WARN 2d: test_send_message_empty_message pattern nao encontrado")
+
+
+# Pattern 4: test_get_conversation_success
+old_get = """    def test_get_conversation_success(self, client):
+        \"\"\"Test retrieving conversation details\"\"\"
+        with patch('app.api.conversation.ClaudeService') as mock_claude:
+            mock_service = Mock()
+            mock_service.send_message.return_value = {
+                "message": "Hello! I'll help you create a service contract."
+            }
+            mock_claude.return_value = mock_service
+
+            # Start conversation
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]"""
+
+new_get = """    def test_get_conversation_success(self, client):
+        \"\"\"Test retrieving conversation details\"\"\"
+        with patch('app.api.conversation._get_claude_service') as mock_get_service, \\
+             patch('app.api.conversation._claude_service', None):
+            mock_service = Mock()
+            mock_service.send_message = AsyncMock(
+                return_value="Hello! I'll help you create a service contract."
+            )
+            mock_get_service.return_value = mock_service
+
+            # Start conversation
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]"""
+
+if old_get in c2:
+    c2 = c2.replace(old_get, new_get, 1)
+    ch2 += 1
+    print("OK 2e: test_get_conversation_success corrigido")
+else:
+    print("WARN 2e: test_get_conversation_success pattern nao encontrado")
+
+
+# Pattern 5: test_delete_conversation_success
+old_del = """    def test_delete_conversation_success(self, client):
+        \"\"\"Test deleting a conversation\"\"\"
+        with patch('app.api.conversation.ClaudeService') as mock_claude:
+            mock_service = Mock()
+            mock_service.send_message.return_value = {
+                "message": "Hello!"
+            }
+            mock_claude.return_value = mock_service
+
+            # Start conversation
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]"""
+
+new_del = """    def test_delete_conversation_success(self, client):
+        \"\"\"Test deleting a conversation\"\"\"
+        with patch('app.api.conversation._get_claude_service') as mock_get_service, \\
+             patch('app.api.conversation._claude_service', None):
+            mock_service = Mock()
+            mock_service.send_message = AsyncMock(return_value="Hello!")
+            mock_get_service.return_value = mock_service
+
+            # Start conversation
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]"""
+
+if old_del in c2:
+    c2 = c2.replace(old_del, new_del, 1)
+    ch2 += 1
+    print("OK 2f: test_delete_conversation_success corrigido")
+else:
+    print("WARN 2f: test_delete_conversation_success pattern nao encontrado")
+
+
+# Pattern 6: test_conversation_completion_with_data
+old_comp = """    def test_conversation_completion_with_data(self, client):
+        \"\"\"Test conversation completion returns collected data\"\"\"
+        with patch('app.api.conversation.ClaudeService') as mock_claude:
+            mock_service = Mock()
+            mock_service.send_message.return_value = {
+                "message": "Hello!"
+            }
+            mock_claude.return_value = mock_service
+
+            # Start conversation
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]
+
+            # Mock completion with data
+            complete_data = {
+                "client_name": "João Silva",
+                "cpf_cnpj": "123.456.789-00",
+                "service_description": "Consultoria",
+                "contract_value": 5000.00
+            }
+            mock_service.collect_contract_data.return_value = {
+                "complete": True,
+                "data": complete_data
+            }"""
+
+new_comp = """    def test_conversation_completion_with_data(self, client):
+        \"\"\"Test conversation completion returns collected data\"\"\"
+        with patch('app.api.conversation._get_claude_service') as mock_get_service, \\
+             patch('app.api.conversation._claude_service', None):
+            mock_service = Mock()
+            mock_service.send_message = AsyncMock(return_value="Hello!")
+            mock_get_service.return_value = mock_service
+
+            # Start conversation
+            start_response = client.post("/api/conversation/start")
+            conversation_id = start_response.json()["conversation_id"]
+
+            # Mock completion with data
+            complete_data = {
+                "client_name": "João Silva",
+                "cpf_cnpj": "123.456.789-00",
+                "service_description": "Consultoria",
+                "contract_value": 5000.00
+            }
+            mock_service.collect_contract_data = AsyncMock(return_value={
+                "complete": True,
+                "data": complete_data
+            })"""
+
+if old_comp in c2:
+    c2 = c2.replace(old_comp, new_comp, 1)
+    ch2 += 1
+    print("OK 2g: test_conversation_completion_with_data corrigido")
+else:
+    print("WARN 2g: test_conversation_completion pattern nao encontrado")
+
+
+# 2h: Catch-all: replace any remaining ClaudeService patches in conversation tests
+# This handles edge cases
+remaining_conv = c2.count("patch('app.api.conversation.ClaudeService')")
+if remaining_conv > 0:
+    c2 = c2.replace(
+        "patch('app.api.conversation.ClaudeService')",
+        "patch('app.api.conversation._get_claude_service')"
+    )
+    ch2 += remaining_conv
+    print(f"OK 2h: {remaining_conv}x remaining ClaudeService patches -> _get_claude_service")
+
+
+with open(path2, "w") as f:
+    f.write(c2)
+
+print(f"\ntest_endpoints.py: {ch2} alteracoes\n")
+total_changes += ch2
+
+
+# ======================================================
+# FIX 3: conftest.py — Auth dependency override
+# ======================================================
+path3 = "/opt/agent-financeiro-aisatec/tests/conftest.py"
+dep_path = "/opt/agent-financeiro-aisatec/app/api/dependencies.py"
+
+import os
+ch3 = 0
+
+# Check if auth dependency file exists on VPS
+if os.path.exists(dep_path):
+    with open(dep_path, "r") as f:
+        dep_content = f.read()
+
+    # Find the verify function name
+    import re as re2
+    verify_match = re2.search(r'(async\s+)?def\s+(verify_\w+|get_api_key)\s*\(', dep_content)
+
+    if verify_match:
+        verify_func = verify_match.group(2)
+        print(f"Auth dependency encontrada: {verify_func}")
+
+        with open(path3, "r") as f:
+            c3 = f.read()
+
+        # Add import for the dependency
+        if verify_func not in c3:
+            # Add override in the client fixture
+            old_override = '    app.dependency_overrides[get_db] = override_get_db'
+            new_override = f'''    app.dependency_overrides[get_db] = override_get_db
+
+    # Override auth dependency for tests
+    try:
+        from app.api.dependencies import {verify_func}
+        app.dependency_overrides[{verify_func}] = lambda: "test-api-key"
+    except ImportError:
+        pass  # Auth dependency not present'''
+
+            if old_override in c3:
+                c3 = c3.replace(old_override, new_override, 1)
+                ch3 += 1
+                print(f"OK 3a: Auth override adicionado para {verify_func}")
+            else:
+                print("WARN 3a: override pattern nao encontrado no conftest")
+
+            with open(path3, "w") as f:
+                f.write(c3)
+        else:
+            print(f"SKIP 3a: {verify_func} ja referenciado no conftest")
+    else:
+        print("WARN 3: Nenhuma funcao verify encontrada em dependencies.py")
+else:
+    print("SKIP 3: dependencies.py nao existe - auth nao adicionada")
+
+print(f"\nconftest.py: {ch3} alteracoes\n")
+total_changes += ch3
+
+
+# ======================================================
+# FIX 4: Limpar singleton entre testes
+# Adicionar fixture que reseta o singleton _claude_service
+# ======================================================
+with open(path3, "r") as f:
+    c3 = f.read()
+
+ch4 = 0
+
+# Add autouse fixture to reset conversation state between tests
+reset_fixture = '''
+
+@pytest.fixture(autouse=True)
+def reset_conversation_state():
+    """Reset conversation singleton and in-memory store between tests."""
+    try:
+        import app.api.conversation as conv_module
+        conv_module._claude_service = None
+        conv_module._conversations.clear()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        import app.api.conversation as conv_module
+        conv_module._claude_service = None
+        conv_module._conversations.clear()
+    except (ImportError, AttributeError):
+        pass
+'''
+
+if "reset_conversation_state" not in c3:
+    # Add before the pytest_configure function
+    if "def pytest_configure" in c3:
+        c3 = c3.replace(
+            "\n# Pytest configuration\ndef pytest_configure",
+            reset_fixture + "\n# Pytest configuration\ndef pytest_configure"
+        )
+        ch4 += 1
+        print("OK 4: Fixture reset_conversation_state adicionada")
+    else:
+        # Append at end if pytest_configure not found
+        c3 += reset_fixture
+        ch4 += 1
+        print("OK 4: Fixture reset_conversation_state adicionada (final)")
+
+    with open(path3, "w") as f:
+        f.write(c3)
+else:
+    print("SKIP 4: reset_conversation_state ja existe")
+
+total_changes += ch4
+
+print(f"\n{'='*50}")
+print(f"TOTAL: {total_changes} alteracoes em 3 arquivos")
+print(f"{'='*50}")
+PYEOF
+
+echo ""
+echo "--- Verificacao ---"
+echo "= test_claude.py ="
+grep -n "AsyncMock\|AsyncAnthropic" /opt/agent-financeiro-aisatec/tests/test_services/test_claude.py | head -10
+echo ""
+echo "= test_endpoints.py ="
+grep -n "_get_claude_service\|AsyncMock\|_claude_service" /opt/agent-financeiro-aisatec/tests/test_api/test_endpoints.py | head -15
+echo ""
+echo "= conftest.py ="
+grep -n "reset_conversation\|verify_\|dependencies" /opt/agent-financeiro-aisatec/tests/conftest.py | head -10
+echo ""
+
+# Teste rapido de sintaxe
+echo "--- Verificacao de Sintaxe ---"
+cd /opt/agent-financeiro-aisatec
+/opt/agent-financeiro-aisatec/venv/bin/python3 -c "
+import ast, sys
+files = [
+    'tests/test_services/test_claude.py',
+    'tests/test_api/test_endpoints.py',
+    'tests/conftest.py'
+]
+ok = True
+for f in files:
+    try:
+        with open(f) as fh:
+            ast.parse(fh.read())
+        print(f'  SYNTAX OK: {f}')
+    except SyntaxError as e:
+        print(f'  SYNTAX ERROR: {f}: {e}')
+        ok = False
+if ok:
+    print('Todos os 3 arquivos com sintaxe valida')
+else:
+    print('ATENCAO: Erros de sintaxe encontrados!')
+    sys.exit(1)
+"
+echo ""
+echo "P2 #8 CONCLUIDO - Testes alinhados com codigo VPS"

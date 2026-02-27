@@ -1,0 +1,90 @@
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+python3 << 'PYEOF'
+import sys
+path = "/opt/agent-financeiro-aisatec/app/services/conta_azul_service.py"
+
+# Backup
+import shutil
+shutil.copy2(path, path + ".bak_pre_oauth")
+print("Backup criado")
+
+with open(path, "r") as f:
+    content = f.read()
+
+changes = 0
+
+# Fix 1: refresh_token - add Basic Auth, remove creds from body
+old_rt = '''"grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"}'''
+new_rt = '''"grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                    },
+                    auth=(client_id, client_secret),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"}'''
+if old_rt in content:
+    content = content.replace(old_rt, new_rt, 1)
+    print("OK Fix1: refresh_token -> Basic Auth")
+    changes += 1
+else:
+    print("SKIP Fix1: refresh_token (already patched or different format)")
+
+# Fix 2: exchange_code - add Basic Auth, remove creds from body
+old_ec = '''"grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"}'''
+new_ec = '''"grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    auth=(client_id, client_secret),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"}'''
+if old_ec in content:
+    content = content.replace(old_ec, new_ec, 1)
+    print("OK Fix2: exchange_code -> Basic Auth")
+    changes += 1
+else:
+    print("SKIP Fix2: exchange_code (already patched or different format)")
+
+# Fix 3: scope do get_authorization_url
+old_scope = "'scope': 'openid',"
+new_scope = "'scope': 'openid profile aws.cognito.signin.user.admin',"
+if old_scope in content:
+    content = content.replace(old_scope, new_scope, 1)
+    print("OK Fix3: scope atualizado com Cognito scopes")
+    changes += 1
+elif new_scope in content:
+    print("SKIP Fix3: scope ja tem Cognito scopes")
+else:
+    print("SKIP Fix3: scope pattern nao encontrado")
+
+with open(path, "w") as f:
+    f.write(content)
+
+print(f"\nTotal: {changes} alteracoes aplicadas")
+if changes == 0:
+    print("ATENCAO: nenhuma alteracao feita, verificar formato do arquivo")
+PYEOF
+
+echo ""
+echo "--- Verificacao ---"
+grep -n "auth=(client_id" /opt/agent-financeiro-aisatec/app/services/conta_azul_service.py
+grep -n "aws.cognito" /opt/agent-financeiro-aisatec/app/services/conta_azul_service.py
+echo ""
+echo "--- Restart ---"
+systemctl restart agent-financeiro
+sleep 3
+systemctl status agent-financeiro --no-pager -l | head -15
+echo ""
+journalctl -u agent-financeiro --no-pager -n 10
+echo ""
+echo "PROXIMO: Acesse https://api.satec.digital/api/auth/conta-azul/authorize"
+echo "Depois teste /fluxo no Telegram"

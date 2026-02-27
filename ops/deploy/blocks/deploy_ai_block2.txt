@@ -1,0 +1,97 @@
+cat > /tmp/deploy_ai.py << 'ENDDEPLOY'
+import os, sys, shutil, subprocess, zlib
+
+os.chdir('/opt/agent-financeiro-aisatec')
+
+# Decompress claude_service
+with open('/tmp/hex_cs.txt') as f:
+    hex1 = f.read().strip().replace('\n', '')
+cs_data = zlib.decompress(bytes.fromhex(hex1))
+print(f'[1] claude_service: {len(cs_data)} bytes')
+
+# Decompress config
+with open('/tmp/hex_cfg.txt') as f:
+    hex2 = f.read().strip().replace('\n', '')
+cfg_data = zlib.decompress(bytes.fromhex(hex2))
+print(f'[2] config: {len(cfg_data)} bytes')
+
+# Backup originals
+for f in ['app/services/claude_service.py', 'app/config.py']:
+    if os.path.exists(f):
+        shutil.copy2(f, f + '.bak_ai')
+print('[3] Backups created (.bak_ai)')
+
+# Write new files
+with open('app/services/claude_service.py', 'wb') as f:
+    f.write(cs_data)
+with open('app/config.py', 'wb') as f:
+    f.write(cfg_data)
+print('[4] Files written')
+
+# Syntax check both
+for f in ['app/services/claude_service.py', 'app/config.py']:
+    r = subprocess.run(
+        ['venv/bin/python3', '-c',
+         f'import py_compile; py_compile.compile("{f}", doraise=True)'],
+        capture_output=True, text=True
+    )
+    if r.returncode:
+        print(f'[ERR] Syntax error in {f}: {r.stderr}')
+        # Restore backup
+        shutil.copy2(f + '.bak_ai', f)
+        print(f'[RESTORED] {f}')
+        sys.exit(1)
+    print(f'[5] Syntax OK: {f}')
+
+# Install openai and google-generativeai packages
+print('[6] Installing AI packages...')
+for pkg in ['openai', 'google-generativeai']:
+    r = subprocess.run(
+        ['venv/bin/pip', 'install', '-q', pkg],
+        capture_output=True, text=True
+    )
+    if r.returncode:
+        print(f'  [WARN] {pkg}: {r.stderr[:100]}')
+    else:
+        print(f'  [OK] {pkg} installed')
+
+# Check .env for AI keys
+with open('.env') as f:
+    env = f.read()
+
+has_openai = 'OPENAI_API_KEY=' in env and len([l for l in env.split('\n') if l.startswith('OPENAI_API_KEY=') and len(l.split('=',1)[1].strip()) > 5]) > 0
+has_gemini = 'GOOGLE_API_KEY=' in env and len([l for l in env.split('\n') if l.startswith('GOOGLE_API_KEY=') and len(l.split('=',1)[1].strip()) > 5]) > 0
+has_claude = 'ANTHROPIC_API_KEY=' in env and len([l for l in env.split('\n') if l.startswith('ANTHROPIC_API_KEY=') and l.split('=',1)[1].strip().startswith('sk-ant-api')]) > 0
+
+print(f'\n[7] API Keys configured:')
+print(f'  OpenAI:  {"SIM" if has_openai else "NAO"}')
+print(f'  Gemini:  {"SIM" if has_gemini else "NAO"}')
+print(f'  Claude:  {"SIM" if has_claude else "NAO (token OAuth nao funciona)"}')
+
+if not has_openai and not has_gemini and not has_claude:
+    print('\n[AVISO] Nenhuma chave AI valida configurada!')
+    print('Adicione ao .env uma das opcoes:')
+    print('  GOOGLE_API_KEY=sua-chave   (GRATIS - recomendado)')
+    print('  OPENAI_API_KEY=sk-...      (barato ~$1/mes)')
+    print('  ANTHROPIC_API_KEY=sk-ant-api03-...  (API key, nao OAuth)')
+    print('\nServico NAO sera reiniciado ate configurar uma chave.')
+    sys.exit(0)
+
+# Restart service
+subprocess.run(['sudo', 'systemctl', 'restart', 'agent-financeiro'], check=True)
+import time; time.sleep(3)
+s = subprocess.run(['sudo', 'systemctl', 'is-active', 'agent-financeiro'],
+                   capture_output=True, text=True).stdout.strip()
+print(f'\n[8] Service: {s}')
+if s == 'active':
+    provider = 'auto-detect'
+    if has_openai: provider = 'OpenAI (gpt-4o-mini)'
+    elif has_gemini: provider = 'Gemini (gemini-2.0-flash)'
+    elif has_claude: provider = 'Claude'
+    print(f'\n=== DEPLOY OK! Provider: {provider} ===')
+    print('Teste: /novo_contrato ou mande uma mensagem livre no Telegram')
+else:
+    print('\n=== ERRO! ===')
+    subprocess.run(['sudo', 'journalctl', '-u', 'agent-financeiro', '-n', '20', '--no-pager'])
+ENDDEPLOY
+python3 /tmp/deploy_ai.py

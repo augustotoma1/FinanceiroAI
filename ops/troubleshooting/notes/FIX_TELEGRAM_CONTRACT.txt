@@ -1,0 +1,167 @@
+## P1 #5 — Corrigir mapeamento de campos no fluxo de contratos do Telegram
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+python3 << 'PYEOF'
+import shutil
+
+path = "/opt/agent-financeiro-aisatec/app/services/telegram_bot.py"
+shutil.copy2(path, path + ".bak_pre_contract_fix")
+print("Backup: telegram_bot.py.bak_pre_contract_fix")
+
+with open(path, "r") as f:
+    content = f.read()
+
+changes = 0
+
+# =============================================
+# Fix 1: Reescrever bloco de salvamento do contrato
+#         - Buscar/criar client por nome/cpf_cnpj
+#         - Gerar contract_number automatico
+#         - Mapear special_clauses -> notes
+#         - Parsear start_date como Date
+# =============================================
+
+old_save = """                # Save to database
+                try:
+                    db = next(get_db())
+                    new_contract = Contract(
+                        client_name=contract_data.get("client_name"),
+                        cpf_cnpj=contract_data.get("cpf_cnpj"),
+                        service_description=contract_data.get("service_description"),
+                        contract_value=float(contract_data.get("contract_value", 0)),
+                        payment_terms=contract_data.get("payment_terms"),
+                        start_date=contract_data.get("start_date"),
+                        duration_months=int(contract_data.get("duration_months", 0)),
+                        special_clauses=contract_data.get("special_clauses"),
+                        status="draft",
+                    )
+                    db.add(new_contract)
+                    db.commit()
+                    db.close()
+                    await update.message.reply_text(
+                        f"\U0001f4be Contrato salvo como rascunho no sistema!"
+                    )
+                except Exception as e:
+                    logger.error(f"Error saving contract: {e}")
+                    await update.message.reply_text(
+                        "\u26a0\ufe0f Dados coletados mas houve erro ao salvar. "
+                        "Use a API para registrar manualmente."
+                    )"""
+
+new_save = """                # Save to database
+                try:
+                    db = next(get_db())
+
+                    # --- Buscar ou criar cliente ---
+                    from app.models.client import Client as ClientModel
+                    cpf_cnpj = contract_data.get("cpf_cnpj", "").strip()
+                    client_name = contract_data.get("client_name", "").strip()
+
+                    client = None
+                    if cpf_cnpj:
+                        client = db.query(ClientModel).filter_by(cpf_cnpj=cpf_cnpj).first()
+                    if not client and client_name:
+                        client = db.query(ClientModel).filter(
+                            ClientModel.name.ilike(f"%{client_name}%")
+                        ).first()
+
+                    if not client:
+                        # Criar cliente automaticamente
+                        client = ClientModel(
+                            name=client_name or "Cliente sem nome",
+                            cpf_cnpj=cpf_cnpj or "00000000000",
+                            email=contract_data.get("email", ""),
+                        )
+                        db.add(client)
+                        db.flush()  # get client.id
+
+                    # --- Gerar contract_number ---
+                    from datetime import date as _date_type
+                    year = _date_type.today().year
+                    last_contract = db.query(Contract).filter(
+                        Contract.contract_number.like(f"CTR-{year}-%")
+                    ).order_by(Contract.id.desc()).first()
+
+                    if last_contract and last_contract.contract_number:
+                        try:
+                            seq = int(last_contract.contract_number.split("-")[-1]) + 1
+                        except ValueError:
+                            seq = 1
+                    else:
+                        seq = 1
+                    contract_number = f"CTR-{year}-{seq:03d}"
+
+                    # --- Parsear start_date ---
+                    raw_start = contract_data.get("start_date", "")
+                    if isinstance(raw_start, str) and raw_start:
+                        try:
+                            from datetime import datetime as _dt
+                            start_date = _dt.strptime(raw_start[:10], "%Y-%m-%d").date()
+                        except (ValueError, TypeError):
+                            try:
+                                start_date = _dt.strptime(raw_start[:10], "%d/%m/%Y").date()
+                            except (ValueError, TypeError):
+                                start_date = _date_type.today()
+                    else:
+                        start_date = _date_type.today()
+
+                    # --- Calcular end_date ---
+                    duration = int(contract_data.get("duration_months", 0) or 0)
+                    from dateutil.relativedelta import relativedelta
+                    try:
+                        end_date = start_date + relativedelta(months=duration) if duration > 0 else None
+                    except ImportError:
+                        end_date = None
+
+                    new_contract = Contract(
+                        client_id=client.id,
+                        contract_number=contract_number,
+                        service_description=contract_data.get("service_description", "Serviço contábil"),
+                        contract_value=float(contract_data.get("contract_value", 0) or 0),
+                        payment_terms=contract_data.get("payment_terms", "A combinar"),
+                        start_date=start_date,
+                        end_date=end_date,
+                        duration_months=duration,
+                        notes=contract_data.get("special_clauses", ""),
+                        status="draft",
+                    )
+                    db.add(new_contract)
+                    db.commit()
+                    db.close()
+                    await update.message.reply_text(
+                        f"\U0001f4be Contrato *{contract_number}* salvo como rascunho!",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Error saving contract: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        "\u26a0\ufe0f Dados coletados mas houve erro ao salvar. "
+                        "Use a API para registrar manualmente."
+                    )"""
+
+if old_save in content:
+    content = content.replace(old_save, new_save, 1)
+    print("OK 1: bloco de salvamento de contrato reescrito")
+    changes += 1
+else:
+    print("WARN 1: bloco de salvamento nao encontrado (ja corrigido?)")
+
+with open(path, "w") as f:
+    f.write(content)
+
+print(f"\nTotal: {changes} alteracoes aplicadas")
+PYEOF
+
+echo ""
+echo "--- Verificacao ---"
+grep -n "client_id=\|contract_number=\|client_name=" /opt/agent-financeiro-aisatec/app/services/telegram_bot.py | head -10
+echo ""
+echo "--- Instalar python-dateutil (se nao existe) ---"
+/opt/agent-financeiro-aisatec/venv/bin/pip install python-dateutil --quiet 2>&1 | tail -1
+echo ""
+echo "--- Restart ---"
+systemctl restart agent-financeiro
+sleep 3
+systemctl status agent-financeiro --no-pager -l | head -10
+echo ""
+echo "P1 #5 CONCLUIDO - Mapeamento de campos de contrato corrigido"

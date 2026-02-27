@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+FIX_NAMEERROR.txt
+=================
+Corrige 2 bugs:
+1. NameError: name 'endpoint' is not defined em make_api_request
+   (introduzido pelo FIX_SALDOS_ZERO.txt - debug logging crasheia o response)
+2. Dual-credentials bug em refresh_access_token (envia auth em body + header)
+
+Uso no VPS:
+  cd /opt/agent-financeiro-aisatec
+  source venv/bin/activate
+  python3 FIX_NAMEERROR.txt
+  sudo systemctl restart agent-financeiro
+"""
+
+import re
+import sys
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+BASE = Path("/opt/agent-financeiro-aisatec")
+CA_FILE = BASE / "app" / "services" / "conta_azul_service.py"
+
+def backup(path):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = path.with_suffix(f".bak_{ts}")
+    shutil.copy2(path, dst)
+    print(f"  Backup: {dst.name}")
+    return dst
+
+def fix_make_api_request(content):
+    """
+    Fix 1: Remove debug logging that causes NameError.
+
+    The FIX_SALDOS_ZERO.txt replaced 'return response.json()' with:
+        result = response.json()
+        if isinstance(result, dict):
+            logger.debug(f"API response keys for {endpoint}: ...")
+        ...
+        return result
+
+    The variable 'endpoint' may not be in scope on VPS version.
+    Fix: Replace the problematic block with safe version using try/except.
+    """
+
+    # Strategy: Find the problematic pattern and make it safe
+    # Pattern 1: The exact code I added (result = response.json() ... return result)
+
+    # First, let's try to find and fix the specific pattern
+    # The debug logging block looks like:
+    #   result = response.json()
+    #   if isinstance(result, dict):
+    #       logger.debug(f"API response keys for {endpoint}: {list(result.keys())}")
+    #   elif isinstance(result, list):
+    #       logger.debug(f"API response for {endpoint}: list with {len(result)} items")
+    #   return result
+
+    pattern = re.compile(
+        r'(\s+)result\s*=\s*response\.json\(\)\s*\n'
+        r'\s+if\s+isinstance\(result,\s*dict\):\s*\n'
+        r'\s+logger\.debug\(f"API response keys for \{endpoint\}.*?\n'
+        r'(?:\s+elif\s+isinstance\(result,\s*list\):\s*\n'
+        r'\s+logger\.debug\(f"API response for \{endpoint\}.*?\n)?'
+        r'\s+return\s+result',
+        re.DOTALL
+    )
+
+    match = pattern.search(content)
+    if match:
+        indent = match.group(1)
+        replacement = f"{indent}return response.json()"
+        content = content[:match.start()] + replacement + content[match.end():]
+        print("  [OK] Removed problematic debug logging in make_api_request")
+        return content, True
+
+    # Pattern 2: Maybe slightly different formatting - try broader regex
+    pattern2 = re.compile(
+        r'(\s+)result\s*=\s*response\.json\(\).*?'
+        r'logger\.debug\(f"API response.*?endpoint.*?'
+        r'return\s+result',
+        re.DOTALL
+    )
+
+    match2 = pattern2.search(content)
+    if match2:
+        indent = match2.group(1)
+        replacement = f"{indent}return response.json()"
+        content = content[:match2.start()] + replacement + content[match2.end():]
+        print("  [OK] Removed problematic debug logging (pattern 2)")
+        return content, True
+
+    # Pattern 3: Maybe the code uses a different variable name - find any
+    # result = response.json() ... logger.debug(... endpoint ...) ... return result
+    # in the make_api_request method
+    pattern3 = re.compile(
+        r'(\s+)(result\s*=\s*response\.json\(\)\s*\n(?:.*\n)*?\s*return\s+result)',
+        re.MULTILINE
+    )
+
+    for m in pattern3.finditer(content):
+        block = m.group(2)
+        if 'endpoint' in block and 'logger.debug' in block:
+            indent = m.group(1)
+            replacement = f"{indent}return response.json()"
+            content = content[:m.start()] + replacement + content[m.end():]
+            print("  [OK] Removed problematic debug logging (pattern 3)")
+            return content, True
+
+    # Last resort: just find any "result = response.json()" near "endpoint"
+    # and convert back to simple return
+    lines = content.split('\n')
+    new_lines = []
+    skip_until_return = False
+    fixed = False
+
+    for i, line in enumerate(lines):
+        if skip_until_return:
+            stripped = line.strip()
+            if stripped.startswith('return result'):
+                new_lines.append(line.replace('return result', 'return response.json()'))
+                skip_until_return = False
+                fixed = True
+                continue
+            elif stripped.startswith('if isinstance(result') or \
+                 stripped.startswith('elif isinstance(result') or \
+                 stripped.startswith('logger.debug('):
+                continue  # skip these lines
+            elif stripped == '' or stripped.startswith('#'):
+                continue
+            else:
+                # Unexpected line, stop skipping
+                skip_until_return = False
+                new_lines.append(line)
+                continue
+
+        if 'result = response.json()' in line and not fixed:
+            # Check next few lines for the endpoint reference
+            lookahead = '\n'.join(lines[i:i+6])
+            if 'endpoint' in lookahead and 'logger.debug' in lookahead:
+                skip_until_return = True
+                continue  # skip the result = response.json() line
+
+        new_lines.append(line)
+
+    if fixed:
+        content = '\n'.join(new_lines)
+        print("  [OK] Removed problematic debug logging (line-by-line)")
+        return content, True
+
+    print("  [SKIP] Debug logging pattern not found (may already be fixed)")
+    return content, False
+
+
+def fix_dual_credentials(content):
+    """
+    Fix 2: Remove auth= parameter from refresh_access_token.
+
+    Currently sends credentials BOTH in body (client_id, client_secret)
+    AND as Basic Auth (auth= parameter). Should only be in body.
+    """
+
+    # Find the pattern in refresh_access_token: auth=(self.client_id, self.client_secret)
+    # or auth=(...) near "refresh_token" or "grant_type"
+
+    # Pattern: auth=(self.client_id, self.client_secret) or similar
+    # We want to remove the auth= parameter from the httpx.post/client.post call
+
+    # Strategy: Find refresh_access_token method, find the post call, remove auth= param
+
+    # Simple approach: remove ", auth=(self.client_id, self.client_secret)" or similar
+    patterns = [
+        r',\s*auth\s*=\s*\(\s*self\.client_id\s*,\s*self\.client_secret\s*\)',
+        r',\s*auth\s*=\s*\(\s*self\.client_id\s*,\s*self\.client_secret\s*\)\s*,',
+        r'auth\s*=\s*\(\s*self\.client_id\s*,\s*self\.client_secret\s*\)\s*,\s*',
+    ]
+
+    # Only apply within refresh_access_token method
+    # Find the method boundaries
+    method_match = re.search(
+        r'(async\s+def\s+refresh_access_token\s*\(.*?\n)((?:[ \t]+.*\n)*)',
+        content
+    )
+
+    if not method_match:
+        # Try non-async
+        method_match = re.search(
+            r'(def\s+refresh_access_token\s*\(.*?\n)((?:[ \t]+.*\n)*)',
+            content
+        )
+
+    if not method_match:
+        print("  [SKIP] refresh_access_token method not found")
+        return content, False
+
+    method_start = method_match.start()
+    method_body = method_match.group(0)
+
+    for pat in patterns:
+        new_body, count = re.subn(pat, '', method_body, count=1)
+        if count > 0:
+            content = content[:method_start] + new_body + content[method_start + len(method_body):]
+            print("  [OK] Removed dual auth= from refresh_access_token")
+            return content, True
+
+    # Check if auth= even exists in the method
+    if 'auth=' in method_body and 'client_id' in method_body:
+        print("  [WARN] Found auth= in refresh_access_token but couldn't auto-remove")
+        print("         Manual check needed")
+    else:
+        print("  [SKIP] No dual auth= found in refresh_access_token (may already be fixed)")
+
+    return content, False
+
+
+def main():
+    print("=" * 60)
+    print("FIX_NAMEERROR - Corrige NameError em make_api_request")
+    print("=" * 60)
+
+    if not CA_FILE.exists():
+        print(f"ERRO: {CA_FILE} nao encontrado!")
+        sys.exit(1)
+
+    # Backup
+    print(f"\n[1/3] Backup de {CA_FILE.name}")
+    backup(CA_FILE)
+
+    content = CA_FILE.read_text(encoding='utf-8')
+
+    # Fix 1: NameError in make_api_request
+    print(f"\n[2/3] Fix 1: NameError em make_api_request")
+    content, fixed1 = fix_make_api_request(content)
+
+    # Fix 2: Dual credentials in refresh_access_token
+    print(f"\n[3/3] Fix 2: Dual credentials em refresh_access_token")
+    content, fixed2 = fix_dual_credentials(content)
+
+    if fixed1 or fixed2:
+        CA_FILE.write_text(content, encoding='utf-8')
+        print(f"\n  Arquivo salvo: {CA_FILE}")
+
+    # Verify syntax
+    print(f"\n[VERIFY] Checando sintaxe...")
+    try:
+        compile(content, str(CA_FILE), 'exec')
+        print("  [OK] Sintaxe valida!")
+    except SyntaxError as e:
+        print(f"  [ERRO] Sintaxe invalida: {e}")
+        print("  Restaure o backup manualmente!")
+        sys.exit(1)
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("RESUMO:")
+    print(f"  Fix 1 (NameError): {'APLICADO' if fixed1 else 'NAO NECESSARIO'}")
+    print(f"  Fix 2 (dual auth): {'APLICADO' if fixed2 else 'NAO NECESSARIO'}")
+    print("=" * 60)
+
+    if fixed1 or fixed2:
+        print("\nProximo passo:")
+        print("  sudo systemctl restart agent-financeiro")
+        print("  # Testar /saldos e /receber no Telegram")
+    else:
+        print("\nNenhuma alteracao necessaria.")
+        print("Se o erro persiste, verifique manualmente:")
+        print(f"  grep -n 'result = response.json' {CA_FILE}")
+        print(f"  grep -n 'endpoint' {CA_FILE}")
+
+
+if __name__ == '__main__':
+    main()

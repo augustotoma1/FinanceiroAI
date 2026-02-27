@@ -1,0 +1,64 @@
+cat > /tmp/deploy_bot.py << 'ENDDEPLOY'
+import os, sys, shutil, subprocess, zlib
+
+os.chdir('/opt/agent-financeiro-aisatec')
+
+# Read and decompress hex data
+with open('/tmp/hex_data.txt') as f:
+    hex_data = f.read().strip().replace('\n', '')
+
+print(f'[1] Hex data: {len(hex_data)} chars')
+
+try:
+    data = zlib.decompress(bytes.fromhex(hex_data))
+    print(f'[2] Decompressed: {len(data)} bytes')
+except Exception as e:
+    print(f'[ERR] Decompress failed: {e}')
+    sys.exit(1)
+
+if len(data) != 38719:
+    print(f'[WARN] Size: got {len(data)}, expected 38719')
+
+F = 'app/services/telegram_bot.py'
+shutil.copy2(F, F + '.bak4')
+print('[3] Backup -> .bak4')
+
+with open(F, 'wb') as fh:
+    fh.write(data)
+print('[4] New file written')
+
+r = subprocess.run(
+    ['venv/bin/python3', '-c',
+     'import py_compile; py_compile.compile("app/services/telegram_bot.py", doraise=True)'],
+    capture_output=True, text=True
+)
+if r.returncode:
+    print(f'[ERR] Syntax: {r.stderr}')
+    shutil.copy2(F + '.bak4', F)
+    print('[RESTORED] Backup restored')
+    sys.exit(1)
+print('[5] Syntax OK')
+
+# Quick verify key functions exist
+with open(F) as fh:
+    content = fh.read()
+checks = ['cmd_receber', 'cmd_pagar', 'cmd_saldos', 'cmd_inadimplencia_ca',
+           '_get_conta_azul_token', '_format_brl', '_esc']
+for fn in checks:
+    if fn in content:
+        print(f'  [OK] {fn}')
+    else:
+        print(f'  [MISSING] {fn}')
+
+subprocess.run(['sudo', 'systemctl', 'restart', 'agent-financeiro'], check=True)
+import time; time.sleep(3)
+s = subprocess.run(['sudo', 'systemctl', 'is-active', 'agent-financeiro'],
+                   capture_output=True, text=True).stdout.strip()
+print(f'[6] Service: {s}')
+if s == 'active':
+    print('\n=== DEPLOY OK! Teste: /start /receber /pagar /saldos /inadimplencia ===')
+else:
+    print('\n=== ERRO! Verificando logs... ===')
+    subprocess.run(['sudo', 'journalctl', '-u', 'agent-financeiro', '-n', '20', '--no-pager'])
+ENDDEPLOY
+python3 /tmp/deploy_bot.py

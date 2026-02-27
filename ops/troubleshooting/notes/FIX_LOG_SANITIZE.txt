@@ -1,0 +1,128 @@
+## P1 #3 — Sanitizar logs sensíveis
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+python3 << 'PYEOF'
+import shutil
+
+# ============================
+# FIX conta_azul_service.py
+# ============================
+path1 = "/opt/agent-financeiro-aisatec/app/services/conta_azul_service.py"
+shutil.copy2(path1, path1 + ".bak_pre_logsanitize")
+print("Backup: conta_azul_service.py.bak_pre_logsanitize")
+
+with open(path1, "r") as f:
+    c1 = f.read()
+
+changes = 0
+
+# --- Line 210: Remove client_id from logs ---
+old = 'logger.info(f"Token exchange client_id: {self.client_id[:8]}...")'
+new = 'logger.info("Token exchange: client_id present")'
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 1: client_id removido do log")
+    changes += 1
+
+# --- Line 211: Remove authorization code from logs ---
+old = 'logger.info(f"Token exchange code: {code[:12]}...")'
+new = 'logger.info("Token exchange: authorization code received")'
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 2: authorization code removido do log")
+    changes += 1
+
+# --- Line 220: CRITICAL - Remove response body with tokens ---
+old = 'logger.info(f"Token exchange response body: {response.text[:500]}")'
+new = 'logger.info(f"Token exchange response: {response.status_code} (body redacted for security)")'
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 3: response body (tokens!) removido do log")
+    changes += 1
+
+# --- Line 224: Sanitize error detail (may contain tokens on error) ---
+old = 'logger.error(f"Token exchange failed: {response.status_code} - {error_detail}")'
+new = 'logger.error(f"Token exchange failed: {response.status_code} - {error_detail[:120]}...")'
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 4: error_detail truncado (exchange)")
+    changes += 1
+
+# --- Line 294: Sanitize refresh error detail ---
+old = 'logger.error(f"Token refresh failed: {response.status_code} - {error_detail}")'
+new = 'logger.error(f"Token refresh failed: {response.status_code} - {error_detail[:120]}...")'
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 5: error_detail truncado (refresh)")
+    changes += 1
+
+with open(path1, "w") as f:
+    f.write(c1)
+
+print(f"\nconta_azul_service.py: {changes} alteracoes")
+
+# ============================
+# FIX auth.py
+# ============================
+path2 = "/opt/agent-financeiro-aisatec/app/api/auth.py"
+shutil.copy2(path2, path2 + ".bak_pre_logsanitize")
+print("\nBackup: auth.py.bak_pre_logsanitize")
+
+with open(path2, "r") as f:
+    c2 = f.read()
+
+changes2 = 0
+
+# State logs - truncated is ok for CSRF but let's remove even that
+old = 'logger.info(f"Redirecting to Conta Azul authorization page with state: {state[:10]}...")'
+new = 'logger.info("Redirecting to Conta Azul authorization page (state generated)")'
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 6: state removido do log authorize")
+    changes2 += 1
+
+# Callback state - the CSRF fix may have changed this, handle both cases
+old_csrf = 'logger.info(f"OAuth state validated successfully: {state[:10]}...")'
+new_csrf = 'logger.info("OAuth state validated successfully")'
+if old_csrf in c2:
+    c2 = c2.replace(old_csrf, new_csrf, 1)
+    print("OK 7: state removido do log callback (csrf fix)")
+    changes2 += 1
+
+# Original callback state (if CSRF fix not applied)
+old_orig = """logger.info(f"Received OAuth callback with state: {state[:10] if state else 'None'}...")"""
+new_orig = 'logger.info("Received OAuth callback with state parameter")'
+if old_orig in c2:
+    c2 = c2.replace(old_orig, new_orig, 1)
+    print("OK 7b: state removido do log callback (original)")
+    changes2 += 1
+
+# Auth error - might contain token info in exception message
+old = 'logger.error(f"Authentication error during OAuth callback: {e}")'
+new = 'logger.error(f"Authentication error during OAuth callback: {type(e).__name__}")'
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 8: exception details removidos do callback error log")
+    changes2 += 1
+
+with open(path2, "w") as f:
+    f.write(c2)
+
+print(f"\nauth.py: {changes2} alteracoes")
+print(f"\nTOTAL: {changes + changes2} alteracoes aplicadas")
+PYEOF
+
+echo ""
+echo "--- Verificacao: logs sensíveis restantes ---"
+echo "= conta_azul_service.py ="
+grep -n "client_id\[:8\]\|code\[:12\]\|response\.text\[:500\]\|response_body" /opt/agent-financeiro-aisatec/app/services/conta_azul_service.py || echo "(nenhum encontrado - OK)"
+echo ""
+echo "= auth.py ="
+grep -n "state\[:10\]" /opt/agent-financeiro-aisatec/app/api/auth.py || echo "(nenhum encontrado - OK)"
+echo ""
+echo "--- Restart ---"
+systemctl restart agent-financeiro
+sleep 3
+systemctl status agent-financeiro --no-pager -l | head -10
+echo ""
+echo "P1 #3 CONCLUIDO - Logs sanitizados"

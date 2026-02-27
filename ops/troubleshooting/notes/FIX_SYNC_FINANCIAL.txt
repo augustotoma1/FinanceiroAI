@@ -1,0 +1,441 @@
+## P1 #4 — Corrigir sync_financial.py
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+python3 << 'PYEOF'
+import shutil
+
+path = "/opt/agent-financeiro-aisatec/app/background/sync_financial.py"
+shutil.copy2(path, path + ".bak_pre_fix")
+print("Backup: sync_financial.py.bak_pre_fix")
+
+with open(path, "r") as f:
+    content = f.read()
+
+changes = 0
+
+# =============================================
+# Fix 1: Adicionar import de date range
+# =============================================
+old_imports = """import logging
+from datetime import datetime, date
+from typing import Dict, Any, List, Tuple, Optional
+from decimal import Decimal
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError"""
+
+new_imports = """import logging
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, List, Tuple, Optional
+from decimal import Decimal
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError"""
+
+if old_imports in content:
+    content = content.replace(old_imports, new_imports, 1)
+    print("OK 1: import timedelta adicionado")
+    changes += 1
+
+# =============================================
+# Fix 2: Substituir get_sales/get_bills_to_receive
+#         por get_contas_receber/get_contas_pagar
+# =============================================
+old_fetch = """        # TODO: Implement get_sales/get_invoices method in ContaAzulService
+        # For now, this will raise an AttributeError until the methods are implemented
+        # The following methods need to be added to conta_azul_service.py:
+        # - get_sales(access_token, limit) -> List[Dict]
+        # - get_bills_to_receive(access_token, limit) -> List[Dict]
+
+        financial_transactions = []
+
+        # Fetch sales/invoices (outgoing - receivables)
+        try:
+            sales = await conta_azul_service.get_sales(
+                access_token=access_token,
+                limit=1000  # Fetch up to 1000 sales per sync
+            )
+            financial_transactions.extend(sales)
+            logger.info(f"Retrieved {len(sales)} sales from Conta Azul")
+        except AttributeError:
+            logger.warning(
+                "ContaAzulService.get_sales() not implemented yet. "
+                "Skipping sales synchronization."
+            )
+
+        # Fetch bills to receive (receivables)
+        try:
+            receivables = await conta_azul_service.get_bills_to_receive(
+                access_token=access_token,
+                limit=1000  # Fetch up to 1000 receivables per sync
+            )
+            financial_transactions.extend(receivables)
+            logger.info(f"Retrieved {len(receivables)} receivables from Conta Azul")
+        except AttributeError:
+            logger.warning(
+                "ContaAzulService.get_bills_to_receive() not implemented yet. "
+                "Skipping receivables synchronization."
+            )
+
+        logger.info(f"Retrieved {len(financial_transactions)} total financial transactions from Conta Azul")"""
+
+new_fetch = """        # Date range: last 90 days
+        data_inicio = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+        data_fim = date.today().strftime("%Y-%m-%d")
+
+        financial_transactions = []
+
+        # Fetch contas a receber (receivables)
+        try:
+            receivables = await conta_azul_service.get_contas_receber(
+                access_token=access_token,
+                data_vencimento_inicio=data_inicio,
+                data_vencimento_fim=data_fim,
+                limit=100
+            )
+            for r in receivables:
+                r["_sync_type"] = "receivable"
+            financial_transactions.extend(receivables)
+            logger.info(f"Retrieved {len(receivables)} contas a receber from Conta Azul")
+        except Exception as e:
+            logger.error(f"Failed to fetch contas a receber: {e}")
+            errors.append(f"contas_receber: {e}")
+            error_count += 1
+
+        # Fetch contas a pagar (payables)
+        try:
+            payables = await conta_azul_service.get_contas_pagar(
+                access_token=access_token,
+                data_vencimento_inicio=data_inicio,
+                data_vencimento_fim=data_fim,
+                limit=100
+            )
+            for p in payables:
+                p["_sync_type"] = "payable"
+            financial_transactions.extend(payables)
+            logger.info(f"Retrieved {len(payables)} contas a pagar from Conta Azul")
+        except Exception as e:
+            logger.error(f"Failed to fetch contas a pagar: {e}")
+            errors.append(f"contas_pagar: {e}")
+            error_count += 1
+
+        logger.info(f"Retrieved {len(financial_transactions)} total financial transactions from Conta Azul")"""
+
+if old_fetch in content:
+    content = content.replace(old_fetch, new_fetch, 1)
+    print("OK 2: get_sales/get_bills_to_receive -> get_contas_receber/get_contas_pagar")
+    changes += 1
+else:
+    print("WARN 2: padrao de fetch nao encontrado (ja corrigido?)")
+
+# =============================================
+# Fix 3: Corrigir token_record.token_expiry -> expires_at
+# =============================================
+old_expiry = """            token_record.token_expiry = datetime.fromisoformat(
+                new_token_data["expires_at"]
+            )"""
+
+new_expiry = """            token_record.expires_at = datetime.fromisoformat(
+                new_token_data["expires_at"]
+            )"""
+
+if old_expiry in content:
+    content = content.replace(old_expiry, new_expiry, 1)
+    print("OK 3: token_record.token_expiry -> token_record.expires_at")
+    changes += 1
+else:
+    print("SKIP 3: token_expiry ja corrigido ou nao encontrado")
+
+# =============================================
+# Fix 4: Reescrever _sync_single_transaction para
+#         mapear campos v2 da API Conta Azul
+# =============================================
+old_sync_fn = """async def _sync_single_transaction(
+    db: Session,
+    transaction_data: Dict[str, Any]
+) -> Tuple[bool, bool]:
+    \"\"\"
+    Synchronize a single financial transaction to the database.
+
+    Creates a new FinancialRecord if one doesn't exist with the given conta_azul_id,
+    or updates an existing record. Uses conta_azul_id as the natural key.
+
+    Args:
+        db: SQLAlchemy database session
+        transaction_data: Dictionary containing transaction data from Conta Azul
+            Expected keys:
+                - id: Conta Azul transaction ID (required)
+                - customer_id: Conta Azul customer ID (required)
+                - type: Transaction type (invoice, sale, receivable, etc.)
+                - number: Transaction number/identifier
+                - description: Transaction description
+                - amount: Transaction amount
+                - currency: Currency code (default: BRL)
+                - status: Transaction status (pending, paid, overdue, cancelled)
+                - created_at: Transaction creation date
+                - due_date: Payment due date
+                - paid_at: Payment date (if paid)
+                - payment_method: Payment method used
+
+    Returns:
+        Tuple of (created: bool, updated: bool)
+            - (True, False) if new record was created
+            - (False, True) if existing record was updated
+            - (False, False) if no changes were needed
+
+    Raises:
+        FinancialSyncDataError: If required data is missing or invalid
+        SQLAlchemyError: If database operation fails
+    \"\"\"
+    # Validate required fields
+    conta_azul_id = transaction_data.get("id")
+    if not conta_azul_id:
+        raise FinancialSyncDataError("Transaction missing required 'id' field")
+
+    conta_azul_customer_id = transaction_data.get("customer_id")
+    if not conta_azul_customer_id:
+        raise FinancialSyncDataError(
+            f"Transaction {conta_azul_id} missing required 'customer_id' field"
+        )
+
+    # Find corresponding local client by conta_azul_id
+    client = db.query(Client).filter_by(
+        conta_azul_id=str(conta_azul_customer_id)
+    ).first()
+
+    if not client:
+        raise FinancialSyncDataError(
+            f"No local client found with conta_azul_id={conta_azul_customer_id}. "
+            "Run client sync first."
+        )
+
+    # Check if record already exists
+    existing_record = db.query(FinancialRecord).filter_by(
+        conta_azul_id=str(conta_azul_id)
+    ).first()
+
+    # Parse transaction data
+    transaction_date = _parse_date(transaction_data.get("created_at"))
+    due_date = _parse_date(transaction_data.get("due_date"))
+    payment_date = _parse_date(transaction_data.get("paid_at"))
+
+    # Calculate days overdue
+    days_overdue = 0
+    if due_date and not payment_date:
+        today = date.today()
+        if today > due_date:
+            days_overdue = (today - due_date).days
+
+    # Determine transaction status
+    status = transaction_data.get("status", "pending").lower()
+    if days_overdue > 0 and status == "pending":
+        status = "overdue"
+
+    # Parse amount
+    amount = transaction_data.get("amount", 0)
+    if isinstance(amount, (int, float)):
+        amount = Decimal(str(amount))
+    elif isinstance(amount, str):
+        amount = Decimal(amount)
+
+    # Prepare record data
+    record_data = {
+        "client_id": client.id,
+        "transaction_type": transaction_data.get("type", "invoice"),
+        "transaction_number": transaction_data.get("number", f"CA-{conta_azul_id}"),
+        "description": transaction_data.get("description", ""),
+        "amount": amount,
+        "currency": transaction_data.get("currency", "BRL"),
+        "status": status,
+        "transaction_date": transaction_date or date.today(),
+        "due_date": due_date,
+        "payment_date": payment_date,
+        "days_overdue": days_overdue,
+        "conta_azul_id": str(conta_azul_id),
+        "payment_method": transaction_data.get("payment_method"),
+        "notes": transaction_data.get("notes"),
+        "last_synced_at": datetime.utcnow()
+    }
+
+    if existing_record:
+        # Update existing record
+        for key, value in record_data.items():
+            setattr(existing_record, key, value)
+
+        logger.debug(f"Updated financial record: {existing_record.transaction_number}")
+        return (False, True)
+    else:
+        # Create new record
+        new_record = FinancialRecord(**record_data)
+        db.add(new_record)
+        logger.debug(f"Created financial record: {new_record.transaction_number}")
+        return (True, False)"""
+
+new_sync_fn = """async def _sync_single_transaction(
+    db: Session,
+    transaction_data: Dict[str, Any]
+) -> Tuple[bool, bool]:
+    \"\"\"
+    Synchronize a single financial transaction (Conta Azul v2 API format)
+    to a local FinancialRecord in the database.
+
+    Handles field mapping from Conta Azul v2 API format:
+        - id -> conta_azul_id
+        - valor / valor_total -> amount
+        - status -> status (mapped to lowercase)
+        - data_vencimento -> due_date
+        - descricao / observacao -> description
+        - pessoa.id -> customer lookup
+        - _sync_type -> transaction_type (receivable/payable)
+
+    Returns:
+        Tuple of (created: bool, updated: bool)
+    \"\"\"
+    # Extract conta_azul_id (try multiple field names)
+    conta_azul_id = transaction_data.get("id") or transaction_data.get("uuid")
+    if not conta_azul_id:
+        raise FinancialSyncDataError("Transaction missing required 'id' field")
+
+    # Extract customer/supplier from nested 'pessoa' object or flat fields
+    pessoa = transaction_data.get("pessoa") or {}
+    conta_azul_customer_id = None
+    if isinstance(pessoa, dict):
+        conta_azul_customer_id = pessoa.get("id")
+    if not conta_azul_customer_id:
+        conta_azul_customer_id = transaction_data.get("pessoa_id") or transaction_data.get("customer_id")
+
+    # Find client — if no match, still sync but without client link
+    client = None
+    if conta_azul_customer_id:
+        client = db.query(Client).filter_by(
+            conta_azul_id=str(conta_azul_customer_id)
+        ).first()
+
+    # Check if record already exists
+    existing_record = db.query(FinancialRecord).filter_by(
+        conta_azul_id=str(conta_azul_id)
+    ).first()
+
+    # Parse dates (v2 API field names)
+    due_date = _parse_date(
+        transaction_data.get("data_vencimento")
+        or transaction_data.get("due_date")
+    )
+    transaction_date = _parse_date(
+        transaction_data.get("data_emissao")
+        or transaction_data.get("data_competencia")
+        or transaction_data.get("created_at")
+    )
+    payment_date = _parse_date(
+        transaction_data.get("data_pagamento")
+        or transaction_data.get("paid_at")
+    )
+
+    # Calculate days overdue
+    days_overdue = 0
+    if due_date and not payment_date:
+        today = date.today()
+        if today > due_date:
+            days_overdue = (today - due_date).days
+
+    # Map status (Conta Azul v2 uses uppercase PT-BR)
+    raw_status = (transaction_data.get("status", "") or "").upper()
+    if raw_status in ("QUITADO", "RECEBIDO", "PAGO", "LIQUIDADO"):
+        status = "paid"
+    elif raw_status == "CANCELADO":
+        status = "cancelled"
+    elif days_overdue > 0:
+        status = "overdue"
+    else:
+        status = "pending"
+
+    # Parse amount (v2 field names)
+    raw_amount = (
+        transaction_data.get("valor")
+        or transaction_data.get("valor_total")
+        or transaction_data.get("amount")
+        or 0
+    )
+    if isinstance(raw_amount, (int, float)):
+        amount = Decimal(str(raw_amount))
+    elif isinstance(raw_amount, str):
+        amount = Decimal(raw_amount)
+    else:
+        amount = Decimal("0")
+
+    # Description (v2 field names)
+    description = (
+        transaction_data.get("descricao")
+        or transaction_data.get("description")
+        or transaction_data.get("observacao")
+        or ""
+    )
+
+    # Transaction type from _sync_type tag added during fetch
+    sync_type = transaction_data.get("_sync_type", "receivable")
+    tx_type = "receivable" if sync_type == "receivable" else "payable"
+
+    # Person name for notes
+    nome_pessoa = ""
+    if isinstance(pessoa, dict):
+        nome_pessoa = pessoa.get("nome", "")
+
+    # Prepare record data
+    record_data = {
+        "transaction_type": tx_type,
+        "transaction_number": str(transaction_data.get("numero", f"CA-{conta_azul_id}")),
+        "description": description[:500] if description else "",
+        "amount": amount,
+        "currency": "BRL",
+        "status": status,
+        "transaction_date": transaction_date or date.today(),
+        "due_date": due_date,
+        "payment_date": payment_date,
+        "days_overdue": days_overdue,
+        "conta_azul_id": str(conta_azul_id),
+        "payment_method": transaction_data.get("forma_pagamento"),
+        "notes": nome_pessoa[:200] if nome_pessoa else None,
+        "last_synced_at": datetime.utcnow()
+    }
+
+    # Only set client_id if we found a matching client
+    if client:
+        record_data["client_id"] = client.id
+
+    if existing_record:
+        for key, value in record_data.items():
+            setattr(existing_record, key, value)
+        logger.debug(f"Updated financial record: {existing_record.transaction_number}")
+        return (False, True)
+    else:
+        new_record = FinancialRecord(**record_data)
+        db.add(new_record)
+        logger.debug(f"Created financial record: {new_record.transaction_number}")
+        return (True, False)"""
+
+if old_sync_fn in content:
+    content = content.replace(old_sync_fn, new_sync_fn, 1)
+    print("OK 4: _sync_single_transaction reescrito com mapeamento v2")
+    changes += 1
+else:
+    print("WARN 4: padrao de _sync_single_transaction nao encontrado")
+
+# Salvar
+with open(path, "w") as f:
+    f.write(content)
+
+print(f"\nTotal: {changes} alteracoes aplicadas em sync_financial.py")
+PYEOF
+
+echo ""
+echo "--- Verificacao ---"
+echo "= Metodos chamados ="
+grep -n "get_contas_receber\|get_contas_pagar\|get_sales\|get_bills_to_receive" /opt/agent-financeiro-aisatec/app/background/sync_financial.py
+echo ""
+echo "= token_expiry vs expires_at ="
+grep -n "token_expiry\|expires_at" /opt/agent-financeiro-aisatec/app/background/sync_financial.py
+echo ""
+echo "--- Restart ---"
+systemctl restart agent-financeiro
+sleep 3
+systemctl status agent-financeiro --no-pager -l | head -10
+echo ""
+echo "P1 #4 CONCLUIDO - sync_financial.py corrigido"

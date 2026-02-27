@@ -1,0 +1,175 @@
+## P2 #7 — Conversation state TTL + cleanup + singleton ClaudeService
+## Adiciona:
+##   1. TTL de 30 min para conversas inativas
+##   2. Limpeza automatica de conversas expiradas
+##   3. Limite maximo de 100 conversas simultaneas
+##   4. ClaudeService singleton (evita criar novo client por request)
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+cp /opt/agent-financeiro-aisatec/app/api/conversation.py /opt/agent-financeiro-aisatec/app/api/conversation.py.bak_pre_ttl
+
+python3 << 'PYEOF'
+import re
+
+path = "/opt/agent-financeiro-aisatec/app/api/conversation.py"
+
+with open(path, "r") as f:
+    content = f.read()
+
+changes = 0
+
+# ===========================================
+# FIX 1: Adicionar constantes TTL e cleanup
+# ===========================================
+# Inserir apos a linha do dict _conversations
+
+old_block = '''# In-memory conversation store
+# In production, this should be replaced with database storage
+# Key: conversation_id, Value: conversation data
+_conversations: Dict[str, Dict[str, Any]] = {}'''
+
+new_block = '''# In-memory conversation store
+# Key: conversation_id, Value: conversation data
+_conversations: Dict[str, Dict[str, Any]] = {}
+
+# TTL e limites
+_CONVERSATION_TTL_SECONDS = 1800  # 30 minutos de inatividade
+_MAX_CONVERSATIONS = 100
+
+
+def _cleanup_expired_conversations():
+    """Remove conversas inativas ha mais de TTL segundos."""
+    now = datetime.utcnow()
+    expired = [
+        cid for cid, conv in _conversations.items()
+        if (now - conv["updated_at"]).total_seconds() > _CONVERSATION_TTL_SECONDS
+    ]
+    for cid in expired:
+        del _conversations[cid]
+    if expired:
+        logger.info(f"Limpeza: {len(expired)} conversas expiradas removidas")
+
+
+# Singleton do ClaudeService (evita criar novo client por request)
+_claude_service: Optional[ClaudeService] = None
+
+
+def _get_claude_service() -> ClaudeService:
+    """Retorna instancia singleton do ClaudeService."""
+    global _claude_service
+    if _claude_service is None:
+        _claude_service = ClaudeService()
+    return _claude_service'''
+
+if old_block in content:
+    content = content.replace(old_block, new_block, 1)
+    changes += 1
+    print("OK 1: TTL constants + cleanup + singleton adicionados")
+else:
+    print("WARN 1: bloco _conversations nao encontrado")
+
+# ===========================================
+# FIX 2: start_conversation - cleanup + limite + singleton
+# ===========================================
+
+# 2a: Adicionar cleanup e limite no inicio de start_conversation
+old_start = '''    try:
+        # Generate unique conversation ID
+        conversation_id = str(uuid.uuid4())
+
+        # Initialize Claude service
+        claude_service = ClaudeService()'''
+
+new_start = '''    try:
+        # Limpar conversas expiradas
+        _cleanup_expired_conversations()
+
+        # Verificar limite de conversas simultaneas
+        if len(_conversations) >= _MAX_CONVERSATIONS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many active conversations. Please try again later."
+            )
+
+        # Generate unique conversation ID
+        conversation_id = str(uuid.uuid4())
+
+        # Claude service singleton
+        claude_service = _get_claude_service()'''
+
+if old_start in content:
+    content = content.replace(old_start, new_start, 1)
+    changes += 1
+    print("OK 2: start_conversation - cleanup + limite + singleton")
+else:
+    print("WARN 2: bloco start_conversation nao encontrado")
+
+# ===========================================
+# FIX 3: send_message - singleton ClaudeService
+# ===========================================
+
+old_send = '''        # Initialize Claude service
+        claude_service = ClaudeService()'''
+
+new_send = '''        # Claude service singleton
+        claude_service = _get_claude_service()'''
+
+if old_send in content:
+    content = content.replace(old_send, new_send, 1)
+    changes += 1
+    print("OK 3: send_message - singleton ClaudeService")
+else:
+    print("WARN 3: bloco send_message singleton nao encontrado")
+
+# ===========================================
+# FIX 4: Adicionar cleanup no get_conversation tambem
+# ===========================================
+
+old_get = '''    if conversation_id not in _conversations:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation {conversation_id} not found"
+        )
+
+    conversation = _conversations[conversation_id]
+
+    return ConversationResponse('''
+
+new_get = '''    _cleanup_expired_conversations()
+
+    if conversation_id not in _conversations:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation {conversation_id} not found"
+        )
+
+    conversation = _conversations[conversation_id]
+
+    return ConversationResponse('''
+
+if old_get in content:
+    content = content.replace(old_get, new_get, 1)
+    changes += 1
+    print("OK 4: get_conversation - cleanup adicionado")
+else:
+    print("WARN 4: bloco get_conversation nao encontrado")
+
+# ===========================================
+# Salvar
+# ===========================================
+with open(path, "w") as f:
+    f.write(content)
+
+print(f"\nconversation.py: {changes} alteracoes")
+PYEOF
+
+echo ""
+echo "--- Verificacao ---"
+grep -n "TTL\|_cleanup\|_get_claude\|_MAX_CONV\|429" /opt/agent-financeiro-aisatec/app/api/conversation.py
+echo ""
+echo "--- Restart ---"
+systemctl restart agent-financeiro
+sleep 3
+systemctl status agent-financeiro --no-pager -l | head -10
+echo ""
+echo "P2 #7 CONCLUIDO - Conversation TTL + cleanup + singleton"

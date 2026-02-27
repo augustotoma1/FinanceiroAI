@@ -1,0 +1,175 @@
+## P2 #6 — Corrigir sync clients em async methods
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+python3 << 'PYEOF'
+import shutil
+
+# ============================
+# FIX 1: claude_service.py
+# Anthropic() sync -> AsyncAnthropic() async
+# ============================
+path1 = "/opt/agent-financeiro-aisatec/app/services/claude_service.py"
+shutil.copy2(path1, path1 + ".bak_pre_async")
+print("Backup: claude_service.py.bak_pre_async")
+
+with open(path1, "r") as f:
+    c1 = f.read()
+
+ch1 = 0
+
+# Fix import
+old = "from anthropic import Anthropic, APIError, APIConnectionError, RateLimitError"
+new = "from anthropic import AsyncAnthropic, Anthropic, APIError, APIConnectionError, RateLimitError"
+if old in c1 and "AsyncAnthropic" not in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 1a: import AsyncAnthropic adicionado")
+    ch1 += 1
+
+# Fix init: Anthropic() -> AsyncAnthropic()
+old = "            self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)"
+new = "            self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)"
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 1b: Anthropic() -> AsyncAnthropic()")
+    ch1 += 1
+
+# Fix calls: .create( -> await .create(
+# Line 130
+old = "            response = self.client.messages.create(\n                model=self.model,\n                max_tokens=max_tokens,\n                system=system_prompt,\n                messages=conversation_history\n            )"
+new = "            response = await self.client.messages.create(\n                model=self.model,\n                max_tokens=max_tokens,\n                system=system_prompt,\n                messages=conversation_history\n            )"
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 1c: await adicionado em collect_contract_data")
+    ch1 += 1
+
+# Line 238
+old = "            response = self.client.messages.create(**params)"
+new = "            response = await self.client.messages.create(**params)"
+if old in c1:
+    c1 = c1.replace(old, new, 1)
+    print("OK 1d: await adicionado em send_message")
+    ch1 += 1
+
+with open(path1, "w") as f:
+    f.write(c1)
+
+print(f"\nclaude_service.py: {ch1} alteracoes\n")
+
+# ============================
+# FIX 2: autentique_service.py
+# RequestsHTTPTransport sync -> AIOHTTPTransport async
+# ============================
+path2 = "/opt/agent-financeiro-aisatec/app/services/autentique_service.py"
+shutil.copy2(path2, path2 + ".bak_pre_async")
+print("Backup: autentique_service.py.bak_pre_async")
+
+with open(path2, "r") as f:
+    c2 = f.read()
+
+ch2 = 0
+
+# Fix import
+old = "from gql.transport.requests import RequestsHTTPTransport"
+new = "from gql.transport.aiohttp import AIOHTTPTransport"
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 2a: RequestsHTTPTransport -> AIOHTTPTransport")
+    ch2 += 1
+
+# Fix transport init
+old = """            transport = RequestsHTTPTransport(
+                url=self.api_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                verify=True,
+                retries=3,
+                timeout=30
+            )"""
+
+new = """            transport = AIOHTTPTransport(
+                url=self.api_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=30
+            )"""
+
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 2b: transport inicializado como AIOHTTPTransport")
+    ch2 += 1
+
+# Fix client init - need async session
+old = """            self.client = Client(
+                transport=transport,
+                fetch_schema_from_transport=False  # Skip schema fetch for performance
+            )"""
+
+new = """            self.client = Client(
+                transport=transport,
+                fetch_schema_from_transport=False,  # Skip schema fetch for performance
+                execute_timeout=30
+            )"""
+
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 2c: Client execute_timeout adicionado")
+    ch2 += 1
+
+# Fix execute calls: .execute( -> await session.execute(
+# Need to wrap self.client.execute in async session
+# Pattern: result = self.client.execute(...)
+# Replace with: async with self.client as session:\n                result = await session.execute(...)
+
+# Fix create_document execute (around line 260)
+old = "            result = self.client.execute(mutation, variable_values=document_input)"
+new = "            async with self.client as session:\n                result = await session.execute(mutation, variable_values=document_input)"
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 2d: create_document execute -> async session")
+    ch2 += 1
+
+# Fix get_document_status execute (around line 347)
+old = '            result = self.client.execute(query, variable_values={"id": document_id})'
+new = '            async with self.client as session:\n                result = await session.execute(query, variable_values={"id": document_id})'
+if old in c2:
+    c2 = c2.replace(old, new, 1)
+    print("OK 2e: get_document_status execute -> async session")
+    ch2 += 1
+
+# Fix list_documents execute (around line 419)
+old = "            result = self.client.execute("
+# This one is tricky because of multiline - let's find and replace more carefully
+# Read the actual pattern
+import re
+pattern = r'            result = self\.client\.execute\(\n\s+query,\n\s+variable_values=\{"page": page, "limit": limit\}\n\s+\)'
+replacement = '            async with self.client as session:\n                result = await session.execute(\n                    query,\n                    variable_values={"page": page, "limit": limit}\n                )'
+if re.search(pattern, c2):
+    c2 = re.sub(pattern, replacement, c2, count=1)
+    print("OK 2f: list_documents execute -> async session")
+    ch2 += 1
+else:
+    # Fallback - simpler pattern
+    print("SKIP 2f: list_documents pattern nao encontrado (verificar manualmente)")
+
+with open(path2, "w") as f:
+    f.write(c2)
+
+print(f"\nautentique_service.py: {ch2} alteracoes")
+print(f"\nTOTAL: {ch1 + ch2} alteracoes")
+PYEOF
+
+echo ""
+echo "--- Instalar aiohttp (dependencia do AIOHTTPTransport) ---"
+/opt/agent-financeiro-aisatec/venv/bin/pip install aiohttp --quiet 2>&1 | tail -1
+echo ""
+echo "--- Verificacao ---"
+echo "= claude_service.py ="
+grep -n "AsyncAnthropic\|await.*messages.create" /opt/agent-financeiro-aisatec/app/services/claude_service.py
+echo ""
+echo "= autentique_service.py ="
+grep -n "AIOHTTPTransport\|async with self.client\|await session.execute" /opt/agent-financeiro-aisatec/app/services/autentique_service.py
+echo ""
+echo "--- Restart ---"
+systemctl restart agent-financeiro
+sleep 3
+systemctl status agent-financeiro --no-pager -l | head -10
+echo ""
+echo "P2 #6 CONCLUIDO - Async clients corrigidos"

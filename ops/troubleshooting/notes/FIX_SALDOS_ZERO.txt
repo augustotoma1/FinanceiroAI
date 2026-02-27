@@ -1,0 +1,502 @@
+## FIX: Saldos R$ 0 e Pendente R$ 0
+## Causa raiz: API Conta Azul v2 retorna {"itens": [...], "itens_totais": N}
+## mas o codigo procura "data", "items", "content" — nunca "itens"
+## Resultado: lista vazia → tudo R$ 0
+##
+## Tambem verifica/corrige a base URL (api.contaazul.com → api-v2.contaazul.com)
+##
+## Cole este bloco inteiro no terminal SSH do VPS:
+
+# Backup
+cp /opt/agent-financeiro-aisatec/app/services/conta_azul_service.py /opt/agent-financeiro-aisatec/app/services/conta_azul_service.py.bak_pre_saldos
+cp /opt/agent-financeiro-aisatec/app/services/telegram_bot.py /opt/agent-financeiro-aisatec/app/services/telegram_bot.py.bak_pre_saldos
+cp /opt/agent-financeiro-aisatec/app/config.py /opt/agent-financeiro-aisatec/app/config.py.bak_pre_saldos
+
+python3 << 'PYEOF'
+import re
+
+total_changes = 0
+
+# ======================================================
+# PARTE 1: DIAGNOSTICO — verificar config e base URL
+# ======================================================
+print("="*60)
+print("DIAGNOSTICO")
+print("="*60)
+
+config_path = "/opt/agent-financeiro-aisatec/app/config.py"
+with open(config_path, "r") as f:
+    config_content = f.read()
+
+# Check current base URL
+url_match = re.search(r'CONTA_AZUL_API_BASE_URL.*?["\']([^"\']+)["\']', config_content)
+if url_match:
+    current_url = url_match.group(1)
+    print(f"Base URL atual no config: {current_url}")
+    if "api-v2" not in current_url:
+        print("  ⚠️  URL pode estar errada! Deve ser api-v2.contaazul.com")
+    else:
+        print("  ✅ URL parece correta (api-v2)")
+else:
+    print("  ⚠️  CONTA_AZUL_API_BASE_URL nao encontrado no config")
+
+# Check .env override
+import os
+env_file = "/opt/agent-financeiro-aisatec/.env"
+if os.path.exists(env_file):
+    with open(env_file) as f:
+        env_content = f.read()
+    env_url = re.search(r'CONTA_AZUL_API_BASE_URL\s*=\s*(.*)', env_content)
+    if env_url:
+        print(f"Base URL no .env: {env_url.group(1).strip()}")
+    else:
+        print("CONTA_AZUL_API_BASE_URL nao definido no .env (usa default do config)")
+
+print()
+
+# ======================================================
+# PARTE 2: FIX config.py — corrigir base URL default
+# ======================================================
+print("="*60)
+print("FIX 1: Corrigir base URL default no config.py")
+print("="*60)
+
+ch_config = 0
+
+old_url = 'CONTA_AZUL_API_BASE_URL: str = "https://api.contaazul.com"'
+new_url = 'CONTA_AZUL_API_BASE_URL: str = "https://api-v2.contaazul.com"'
+
+if old_url in config_content:
+    config_content = config_content.replace(old_url, new_url, 1)
+    ch_config += 1
+    print("OK: api.contaazul.com -> api-v2.contaazul.com")
+elif "api-v2.contaazul.com" in config_content:
+    print("SKIP: Ja usa api-v2.contaazul.com")
+else:
+    print("WARN: Pattern de URL nao encontrado")
+
+if ch_config > 0:
+    with open(config_path, "w") as f:
+        f.write(config_content)
+
+total_changes += ch_config
+
+# Tambem corrigir no .env se existir com URL errada
+if os.path.exists(env_file):
+    with open(env_file, "r") as f:
+        env_content = f.read()
+    if "CONTA_AZUL_API_BASE_URL" in env_content and "api-v2" not in env_content:
+        env_content = re.sub(
+            r'(CONTA_AZUL_API_BASE_URL\s*=\s*).*api\.contaazul\.com.*',
+            r'\1https://api-v2.contaazul.com',
+            env_content
+        )
+        with open(env_file, "w") as f:
+            f.write(env_content)
+        print("OK: .env tambem corrigido para api-v2.contaazul.com")
+        total_changes += 1
+
+print()
+
+
+# ======================================================
+# PARTE 3: FIX conta_azul_service.py — response parsing
+# ======================================================
+print("="*60)
+print("FIX 2: Corrigir response parsing (adicionar 'itens')")
+print("="*60)
+
+ca_path = "/opt/agent-financeiro-aisatec/app/services/conta_azul_service.py"
+with open(ca_path, "r") as f:
+    ca = f.read()
+
+ch_ca = 0
+
+# Fix get_contas_receber response parsing
+old_receber = 'return response.get("data", response.get("items", response.get("content", [])))'
+new_receber = 'return response.get("itens", response.get("data", response.get("items", response.get("content", []))))'
+
+# Count occurrences (should be 3: receber, pagar, financeiras)
+count_old = ca.count(old_receber)
+if count_old > 0:
+    ca = ca.replace(old_receber, new_receber)
+    ch_ca += count_old
+    print(f"OK: {count_old}x response parsing corrigido (adicionado 'itens' como primeira opcao)")
+elif 'response.get("itens"' in ca:
+    print("SKIP: 'itens' ja esta no parsing")
+else:
+    print("WARN: Pattern de response parsing nao encontrado")
+    # Try a more flexible approach
+    # Look for the pattern in each method individually
+    patterns_to_fix = [
+        # get_contas_financeiras
+        ('response.get("data", response.get("items", response.get("content", [])))',
+         'response.get("itens", response.get("data", response.get("items", response.get("content", []))))'),
+    ]
+    for old_p, new_p in patterns_to_fix:
+        if old_p in ca:
+            ca = ca.replace(old_p, new_p)
+            ch_ca += 1
+            print(f"OK (fallback): pattern corrigido")
+
+# Also fix get_customers if it doesn't handle "itens"
+# Check if get_customers already handles "itens"
+if 'response.get("data", response.get("items", []))' in ca and '"itens"' not in ca.split('get_customers')[1].split('def ')[0] if 'get_customers' in ca else True:
+    old_cust = 'customers = response.get("data", response.get("items", []))'
+    new_cust = 'customers = response.get("itens", response.get("data", response.get("items", [])))'
+    if old_cust in ca:
+        ca = ca.replace(old_cust, new_cust, 1)
+        ch_ca += 1
+        print("OK: get_customers response parsing tambem corrigido")
+
+# Add logging of response keys for debugging
+# Add after each API call in financial methods
+old_log_financ = 'logger.info("Fetching contas financeiras")'
+new_log_financ = 'logger.info("Fetching contas financeiras (will try itens/data/items/content keys)")'
+if old_log_financ in ca:
+    ca = ca.replace(old_log_financ, new_log_financ, 1)
+
+old_log_receber = 'logger.info(f"Fetching contas a receber with params: {params}")'
+new_log_receber = 'logger.info(f"Fetching contas a receber with params: {params} (will try itens/data/items/content keys)")'
+if old_log_receber in ca:
+    ca = ca.replace(old_log_receber, new_log_receber, 1)
+
+old_log_pagar = 'logger.info(f"Fetching contas a pagar with params: {params}")'
+new_log_pagar = 'logger.info(f"Fetching contas a pagar with params: {params} (will try itens/data/items/content keys)")'
+if old_log_pagar in ca:
+    ca = ca.replace(old_log_pagar, new_log_pagar, 1)
+
+# Also add response key logging in make_api_request for debugging
+old_return_json = '                return response.json()'
+new_return_json = '''                result = response.json()
+                if isinstance(result, dict):
+                    logger.debug(f"API response keys for {endpoint}: {list(result.keys())}")
+                elif isinstance(result, list):
+                    logger.debug(f"API response for {endpoint}: list with {len(result)} items")
+                return result'''
+if old_return_json in ca and 'API response keys' not in ca:
+    ca = ca.replace(old_return_json, new_return_json, 1)
+    ch_ca += 1
+    print("OK: Debug logging adicionado em make_api_request")
+
+with open(ca_path, "w") as f:
+    f.write(ca)
+
+print(f"\nconta_azul_service.py: {ch_ca} alteracoes")
+total_changes += ch_ca
+print()
+
+
+# ======================================================
+# PARTE 4: FIX telegram_bot.py — cmd_saldos melhorado
+# ======================================================
+print("="*60)
+print("FIX 3: Melhorar cmd_saldos para sempre buscar saldo individual")
+print("="*60)
+
+bot_path = "/opt/agent-financeiro-aisatec/app/services/telegram_bot.py"
+with open(bot_path, "r") as f:
+    bot = f.read()
+
+ch_bot = 0
+
+# Fix 3a: In cmd_saldos, always fetch individual balance (not just when different)
+# The current code only uses individual balance when it differs from the list balance
+# But the list balance is usually 0 (not returned by the API)
+# Fix: Always use the individual balance when available
+
+old_saldo_block = """        for conta in contas:
+            nome = conta.get("nome", "") or conta.get("descricao", "") or conta.get("name", "") or "Sem nome"
+            tipo = (conta.get("tipo", "") or conta.get("type", "") or "OUTROS").upper()
+            emoji = tipo_emoji.get(tipo, "📋")
+            saldo = float(conta.get("saldo", 0) or conta.get("saldo_atual", 0) or conta.get("balance", 0) or 0)
+            ativo = conta.get("ativo", True)
+
+            if not ativo:
+                continue
+
+            total_saldo += saldo
+            saldo_str = _format_brl(saldo)
+            sinal = "🟢" if saldo >= 0 else "🔴"
+            lines.append(f"{emoji} {nome}\\n   {sinal} Saldo: {saldo_str}")
+
+            # Try to fetch individual balance if account has id
+            conta_id = conta.get("id")
+            if conta_id:
+                try:
+                    saldo_data = await service.get_saldo_conta(access_token, str(conta_id))
+                    if saldo_data:
+                        saldo_real = float(saldo_data.get("saldo", 0) or saldo_data.get("valor", 0) or 0)
+                        if saldo_real != saldo:
+                            lines[-1] = f"{emoji} {nome}\\n   {sinal} Saldo: {_format_brl(saldo_real)}"
+                            total_saldo = total_saldo - saldo + saldo_real
+                except Exception:
+                    pass  # Use original saldo"""
+
+new_saldo_block = """        for conta in contas:
+            nome = conta.get("nome", "") or conta.get("descricao", "") or conta.get("name", "") or "Sem nome"
+            tipo = (conta.get("tipo", "") or conta.get("type", "") or "OUTROS").upper()
+            emoji = tipo_emoji.get(tipo, "📋")
+            ativo = conta.get("ativo", True)
+
+            if not ativo:
+                continue
+
+            # Tentar pegar saldo do endpoint individual (mais confiavel)
+            saldo = 0.0
+            conta_id = conta.get("id")
+            if conta_id:
+                try:
+                    saldo_data = await service.get_saldo_conta(access_token, str(conta_id))
+                    if saldo_data:
+                        saldo = float(
+                            saldo_data.get("saldo", 0)
+                            or saldo_data.get("saldo_atual", 0)
+                            or saldo_data.get("valor", 0)
+                            or saldo_data.get("balance", 0)
+                            or 0
+                        )
+                        logger.info(f"Saldo individual para {nome}: {saldo} (keys: {list(saldo_data.keys())})")
+                except Exception as e:
+                    logger.warning(f"Erro ao buscar saldo individual de {nome}: {e}")
+
+            # Fallback: usar saldo da listagem (se disponivel)
+            if saldo == 0:
+                saldo = float(
+                    conta.get("saldo", 0)
+                    or conta.get("saldo_atual", 0)
+                    or conta.get("balance", 0)
+                    or conta.get("valor_saldo", 0)
+                    or 0
+                )
+
+            total_saldo += saldo
+            saldo_str = _format_brl(saldo)
+            sinal = "🟢" if saldo >= 0 else "🔴"
+            lines.append(f"{emoji} {nome}\\n   {sinal} Saldo: {saldo_str}")"""
+
+if old_saldo_block in bot:
+    bot = bot.replace(old_saldo_block, new_saldo_block, 1)
+    ch_bot += 1
+    print("OK 3a: cmd_saldos reescrito — saldo individual sempre prioritario")
+else:
+    print("WARN 3a: Pattern cmd_saldos nao encontrado (pode ter sido modificado no VPS)")
+    # Tentar fix mais flexivel via regex
+    # Procurar o bloco 'for conta in contas:' dentro de cmd_saldos
+    # e verificar se ja tem a logica melhorada
+    if "Saldo individual para" in bot:
+        print("SKIP 3a: cmd_saldos ja tem logica de saldo individual melhorada")
+    else:
+        print("INFO 3a: Tentando fix flexivel...")
+        # Replace just the key line that decides saldo
+        old_saldo_line = "            saldo = float(conta.get(\"saldo\", 0) or conta.get(\"saldo_atual\", 0) or conta.get(\"balance\", 0) or 0)"
+        if old_saldo_line in bot:
+            # Add valor_saldo as additional field to try
+            new_saldo_line = "            saldo = float(conta.get(\"saldo\", 0) or conta.get(\"saldo_atual\", 0) or conta.get(\"balance\", 0) or conta.get(\"valor_saldo\", 0) or 0)"
+            bot = bot.replace(old_saldo_line, new_saldo_line, 1)
+            ch_bot += 1
+            print("OK 3a (fallback): Adicionado valor_saldo como campo adicional")
+
+
+# Fix 3b: Add response key logging em cmd_saldos
+old_log_keys = '            logger.info(f"First conta financeira keys: {list(contas[0].keys())}")'
+new_log_keys = '            logger.info(f"First conta financeira keys: {list(contas[0].keys())} | values sample: { {k: str(v)[:50] for k, v in list(contas[0].items())[:8]} }")'
+if old_log_keys in bot:
+    bot = bot.replace(old_log_keys, new_log_keys, 1)
+    ch_bot += 1
+    print("OK 3b: Logging melhorado para mostrar valores amostra")
+
+# Fix 3c: Same for cmd_receber
+old_log_receber = '            logger.info(f"First conta a receber keys: {list(contas[0].keys())}")'
+new_log_receber = '            logger.info(f"First conta a receber keys: {list(contas[0].keys())} | values sample: { {k: str(v)[:50] for k, v in list(contas[0].items())[:8]} }")'
+if old_log_receber in bot:
+    bot = bot.replace(old_log_receber, new_log_receber, 1)
+    ch_bot += 1
+    print("OK 3c: Logging cmd_receber melhorado")
+
+# Fix 3d: valor parsing em cmd_receber — adicionar mais campos possiveis
+old_valor_receber = '            valor = float(conta.get("valor", 0) or conta.get("valor_total", 0) or conta.get("amount", 0) or 0)'
+new_valor_receber = '            valor = float(conta.get("valor", 0) or conta.get("valor_total", 0) or conta.get("valor_liquido", 0) or conta.get("amount", 0) or 0)'
+count_valor = bot.count(old_valor_receber)
+if count_valor > 0:
+    bot = bot.replace(old_valor_receber, new_valor_receber)
+    ch_bot += count_valor
+    print(f"OK 3d: {count_valor}x valor parsing melhorado (adicionado valor_liquido)")
+
+with open(bot_path, "w") as f:
+    f.write(bot)
+
+print(f"\ntelegram_bot.py: {ch_bot} alteracoes")
+total_changes += ch_bot
+print()
+
+
+# ======================================================
+# PARTE 5: FIX sync_financial.py — conectar com metodos existentes
+# ======================================================
+print("="*60)
+print("FIX 4: Conectar sync_financial com metodos existentes")
+print("="*60)
+
+sync_path = "/opt/agent-financeiro-aisatec/app/background/sync_financial.py"
+with open(sync_path, "r") as f:
+    sync = f.read()
+
+ch_sync = 0
+
+# Replace get_sales (not implemented) with get_contas_receber (exists)
+old_sales = """        # Fetch sales/invoices (outgoing - receivables)
+        try:
+            sales = await conta_azul_service.get_sales(
+                access_token=access_token,
+                limit=1000  # Fetch up to 1000 sales per sync
+            )
+            financial_transactions.extend(sales)
+            logger.info(f"Retrieved {len(sales)} sales from Conta Azul")
+        except AttributeError:
+            logger.warning(
+                "ContaAzulService.get_sales() not implemented yet. "
+                "Skipping sales synchronization."
+            )"""
+
+new_sales = """        # Fetch contas a receber (receivables)
+        try:
+            receivables_data = await conta_azul_service.get_contas_receber(
+                access_token=access_token,
+                limit=1000
+            )
+            for item in receivables_data:
+                item["_sync_type"] = "receivable"
+            financial_transactions.extend(receivables_data)
+            logger.info(f"Retrieved {len(receivables_data)} contas a receber from Conta Azul")
+        except Exception as e:
+            logger.warning(f"Error fetching contas a receber: {e}")"""
+
+if old_sales in sync:
+    sync = sync.replace(old_sales, new_sales, 1)
+    ch_sync += 1
+    print("OK 4a: get_sales -> get_contas_receber")
+else:
+    print("WARN 4a: get_sales pattern nao encontrado")
+
+# Replace get_bills_to_receive (not implemented) with get_contas_pagar (exists)
+old_bills = """        # Fetch bills to receive (receivables)
+        try:
+            receivables = await conta_azul_service.get_bills_to_receive(
+                access_token=access_token,
+                limit=1000  # Fetch up to 1000 receivables per sync
+            )
+            financial_transactions.extend(receivables)
+            logger.info(f"Retrieved {len(receivables)} receivables from Conta Azul")
+        except AttributeError:
+            logger.warning(
+                "ContaAzulService.get_bills_to_receive() not implemented yet. "
+                "Skipping receivables synchronization."
+            )"""
+
+new_bills = """        # Fetch contas a pagar (payables)
+        try:
+            payables_data = await conta_azul_service.get_contas_pagar(
+                access_token=access_token,
+                limit=1000
+            )
+            for item in payables_data:
+                item["_sync_type"] = "payable"
+            financial_transactions.extend(payables_data)
+            logger.info(f"Retrieved {len(payables_data)} contas a pagar from Conta Azul")
+        except Exception as e:
+            logger.warning(f"Error fetching contas a pagar: {e}")"""
+
+if old_bills in sync:
+    sync = sync.replace(old_bills, new_bills, 1)
+    ch_sync += 1
+    print("OK 4b: get_bills_to_receive -> get_contas_pagar")
+else:
+    print("WARN 4b: get_bills_to_receive pattern nao encontrado")
+
+# Remove the TODO comment
+old_todo = """        # TODO: Implement get_sales/get_invoices method in ContaAzulService
+        # For now, this will raise an AttributeError until the methods are implemented
+        # The following methods need to be added to conta_azul_service.py:
+        # - get_sales(access_token, limit) -> List[Dict]
+        # - get_bills_to_receive(access_token, limit) -> List[Dict]
+
+        financial_transactions = []"""
+
+new_todo = """        financial_transactions = []"""
+
+if old_todo in sync:
+    sync = sync.replace(old_todo, new_todo, 1)
+    ch_sync += 1
+    print("OK 4c: TODO comment removido")
+
+with open(sync_path, "w") as f:
+    f.write(sync)
+
+print(f"\nsync_financial.py: {ch_sync} alteracoes")
+total_changes += ch_sync
+print()
+
+
+# ======================================================
+# RESUMO
+# ======================================================
+print("="*60)
+print(f"TOTAL: {total_changes} alteracoes")
+print("="*60)
+
+if total_changes == 0:
+    print("\n⚠️ Nenhuma alteracao feita. Os patterns podem ter sido modificados no VPS.")
+    print("Verifique manualmente os arquivos.")
+PYEOF
+
+echo ""
+echo "--- Verificacao de sintaxe ---"
+cd /opt/agent-financeiro-aisatec
+
+/opt/agent-financeiro-aisatec/venv/bin/python3 -c "
+import ast, sys
+files = [
+    'app/services/conta_azul_service.py',
+    'app/services/telegram_bot.py',
+    'app/background/sync_financial.py',
+    'app/config.py'
+]
+ok = True
+for f in files:
+    try:
+        with open(f) as fh:
+            ast.parse(fh.read())
+        print(f'  SYNTAX OK: {f}')
+    except SyntaxError as e:
+        print(f'  SYNTAX ERROR: {f}: {e}')
+        ok = False
+if ok:
+    print('Todos os arquivos com sintaxe valida')
+else:
+    print('ATENCAO: Erros de sintaxe!')
+    sys.exit(1)
+"
+
+echo ""
+echo "--- Verificacao de conteudo ---"
+echo "= config.py - base URL ="
+grep -n "CONTA_AZUL_API_BASE_URL" /opt/agent-financeiro-aisatec/app/config.py
+echo ""
+echo "= conta_azul_service.py - itens key ="
+grep -n '"itens"' /opt/agent-financeiro-aisatec/app/services/conta_azul_service.py | head -5
+echo ""
+echo "= telegram_bot.py - saldo individual ="
+grep -n "saldo_individual\|get_saldo_conta\|Saldo individual" /opt/agent-financeiro-aisatec/app/services/telegram_bot.py | head -5
+echo ""
+echo "= sync_financial.py - metodos conectados ="
+grep -n "get_contas_receber\|get_contas_pagar\|get_sales\|get_bills" /opt/agent-financeiro-aisatec/app/background/sync_financial.py | head -5
+echo ""
+
+# Restart service
+echo "--- Reiniciando servico ---"
+sudo systemctl restart agent-financeiro
+sleep 3
+sudo systemctl status agent-financeiro --no-pager | head -15
+echo ""
+echo "FIX SALDOS CONCLUIDO — teste com /saldos e /receber no Telegram"
