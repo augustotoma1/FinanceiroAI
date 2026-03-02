@@ -380,7 +380,8 @@ def _sync_single_transaction(
         transaction_data.get("data_vencimento") or transaction_data.get("due_date")
     )
     transaction_date = _parse_date(
-        transaction_data.get("data_emissao")
+        transaction_data.get("data_competencia")
+        or transaction_data.get("data_emissao")
         or transaction_data.get("data_lancamento")
         or transaction_data.get("created_at")
     ) or due_date or date.today()
@@ -417,10 +418,7 @@ def _sync_single_transaction(
         or transaction_data.get("description")
         or transaction_data.get("observacao")
     ) or f"Conta a {'receber' if source_kind == 'receber' else 'pagar'}"
-    payment_method = _truncate(
-        transaction_data.get("forma_pagamento") or transaction_data.get("payment_method"),
-        50,
-    ) or None
+    payment_method = _normalize_payment_method(transaction_data)
     currency = (_as_text(transaction_data.get("currency") or transaction_data.get("moeda")) or "BRL").upper()[:3]
 
     source_prefixed_id = _build_source_event_id(source_kind=source_kind, event_id=raw_event_id)
@@ -430,6 +428,7 @@ def _sync_single_transaction(
         notes_chunks.append(f"Numero original: {raw_number}")
     if status_raw:
         notes_chunks.append(f"Status original: {status_raw}")
+    notes_chunks.extend(_build_financial_dimensions_notes(transaction_data))
     notes_chunks.append(f"Fonte: contas a {source_kind}")
     notes = " | ".join(notes_chunks)
 
@@ -720,6 +719,109 @@ def _normalize_status(
         return "overdue"
 
     return "pending"
+
+
+def _normalize_payment_method(transaction_data: Dict[str, Any]) -> Optional[str]:
+    """
+    Normalize payment method values from Conta Azul payload variants.
+
+    Specifically normalizes PIX legacy enum:
+    - PAGAMENTO_INSTANTANEO -> PIX_PAGAMENTO_INSTANTANEO
+    """
+    raw = (
+        transaction_data.get("forma_pagamento")
+        or transaction_data.get("payment_method")
+        or transaction_data.get("tipo_pagamento")
+    )
+
+    if isinstance(raw, dict):
+        raw = (
+            raw.get("tipo_pagamento")
+            or raw.get("tipo")
+            or raw.get("descricao")
+            or raw.get("valor")
+        )
+
+    normalized = ContaAzulService.normalize_payment_type(raw)
+    if not normalized:
+        return None
+    return _truncate(normalized, 50) or None
+
+
+def _build_financial_dimensions_notes(transaction_data: Dict[str, Any]) -> List[str]:
+    """Build notes chunk with Conta Azul financial dimensions (competencia/custos/categorias)."""
+    notes: List[str] = []
+
+    competencia = _parse_date(transaction_data.get("data_competencia"))
+    if competencia:
+        notes.append(f"Competencia: {competencia.isoformat()}")
+
+    centros_raw = (
+        transaction_data.get("centros_de_custo")
+        or transaction_data.get("centrosDeCusto")
+        or transaction_data.get("centro_de_custo")
+        or transaction_data.get("id_centro_custo")
+    )
+    centros = _extract_dimension_labels(centros_raw)
+    if centros:
+        notes.append(f"Centros de custo: {', '.join(centros[:5])}")
+
+    categorias_raw = (
+        transaction_data.get("categorias")
+        or transaction_data.get("categorias_financeiras")
+        or transaction_data.get("categoria")
+    )
+    categorias = _extract_dimension_labels(categorias_raw)
+    if categorias:
+        notes.append(f"Categorias: {', '.join(categorias[:5])}")
+
+    return notes
+
+
+def _extract_dimension_labels(raw_value: Any) -> List[str]:
+    """Extract human-readable labels from list/dict/string dimension payloads."""
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, dict):
+        values = [raw_value]
+    elif isinstance(raw_value, (list, tuple, set)):
+        values = list(raw_value)
+    else:
+        text = _as_text(raw_value)
+        return [text] if text else []
+
+    labels: List[str] = []
+    for entry in values:
+        if isinstance(entry, dict):
+            entry_id = _as_text(
+                entry.get("id")
+                or entry.get("id_centro_custo")
+                or entry.get("id_categoria")
+            )
+            entry_label = _as_text(
+                entry.get("nome")
+                or entry.get("descricao")
+                or entry.get("categoria")
+                or entry.get("centro_custo")
+            )
+            if entry_id and entry_label and entry_id != entry_label:
+                labels.append(f"{entry_label} ({entry_id})")
+            elif entry_label:
+                labels.append(entry_label)
+            elif entry_id:
+                labels.append(entry_id)
+        else:
+            text = _as_text(entry)
+            if text:
+                labels.append(text)
+
+    # Preserve order while deduplicating
+    unique_labels: List[str] = []
+    for label in labels:
+        if label not in unique_labels:
+            unique_labels.append(label)
+    return unique_labels
 
 
 def _calculate_days_overdue(

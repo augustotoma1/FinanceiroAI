@@ -238,3 +238,32 @@ async def test_get_financial_sync_status_returns_aggregates(db_session, monkeypa
     assert status["payable_records"] == 1
     assert status["overdue_records"] == 1
     assert status["last_sync_time"] is not None
+
+
+def test_sync_single_transaction_maps_payment_enum_and_dimensions(db_session):
+    transaction = {
+        "_sync_kind": "receber",
+        "id": "evt-1",
+        "valor": "1250.90",
+        "nao_pago": "1250.90",
+        "status": "PENDENTE",
+        "data_competencia": "2026-02-15",
+        "forma_pagamento": "PAGAMENTO_INSTANTANEO",
+        "centros_de_custo": [{"id": "cc-1", "nome": "Operacoes"}],
+        "categorias": [{"id": "cat-1", "descricao": "Servicos"}],
+        "pessoa": {"id": "cli-xyz", "nome": "Cliente XPTO", "cpf_cnpj": "12345678901"},
+    }
+
+    created, updated = sync_financial._sync_single_transaction(db_session, transaction)
+    db_session.commit()
+
+    assert created is True
+    assert updated is False
+
+    record = db_session.query(FinancialRecord).filter_by(conta_azul_id="receber:evt-1").first()
+    assert record is not None
+    assert record.payment_method == "PIX_PAGAMENTO_INSTANTANEO"
+    assert record.transaction_date.isoformat() == "2026-02-15"
+    assert "Competencia: 2026-02-15" in (record.notes or "")
+    assert "Centros de custo: Operacoes (cc-1)" in (record.notes or "")
+    assert "Categorias: Servicos (cat-1)" in (record.notes or "")

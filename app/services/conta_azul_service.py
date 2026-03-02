@@ -135,6 +135,9 @@ class ContaAzulService:
 
     # OAuth scopes for AWS Cognito (replaces legacy "sales" scope)
     SCOPES = ["openid", "profile", "aws.cognito.signin.user.admin"]
+    SALES_ITEMS_ALLOWED_PAGE_SIZES = {10, 20, 50, 100, 200, 500, 1000}
+    LEGACY_PIX_PAYMENT_TYPE = "PAGAMENTO_INSTANTANEO"
+    CANONICAL_PIX_PAYMENT_TYPE = "PIX_PAGAMENTO_INSTANTANEO"
 
     def __init__(self):
         """
@@ -620,6 +623,7 @@ class ContaAzulService:
         data_vencimento_fim: Optional[str] = None,
         data_vencimento_de: Optional[str] = None,
         data_vencimento_ate: Optional[str] = None,
+        ids_clientes: Optional[List[str]] = None,
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
@@ -639,6 +643,10 @@ class ContaAzulService:
             params["data_vencimento_de"] = data_de
         if data_ate:
             params["data_vencimento_ate"] = data_ate
+        if ids_clientes:
+            valid_ids = [str(v).strip() for v in ids_clientes if str(v).strip()]
+            if valid_ids:
+                params["ids_clientes"] = valid_ids
 
         logger.info(f"Fetching contas a receber with params: {params}")
 
@@ -650,6 +658,76 @@ class ContaAzulService:
         )
 
         return self._extract_items(response)
+
+    @classmethod
+    def normalize_payment_type(cls, payment_type: Any) -> Optional[str]:
+        """
+        Normalize Conta Azul payment type enums to canonical values.
+
+        Handles legacy values returned by older payloads.
+        """
+        raw = str(payment_type or "").strip()
+        if not raw:
+            return None
+
+        upper = raw.upper()
+        if upper in {"PIX", cls.LEGACY_PIX_PAYMENT_TYPE, cls.CANONICAL_PIX_PAYMENT_TYPE}:
+            return cls.CANONICAL_PIX_PAYMENT_TYPE
+        return upper
+
+    async def get_venda_itens_by_sale_id(
+        self,
+        access_token: str,
+        sale_id: str,
+        pagina: int = 1,
+        tamanho_pagina: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve sale items by sale id.
+
+        Conta Azul enforces a fixed set of page sizes for this endpoint.
+        """
+        if pagina < 1:
+            raise ValueError("pagina must be >= 1")
+        if tamanho_pagina not in self.SALES_ITEMS_ALLOWED_PAGE_SIZES:
+            allowed = ", ".join(str(v) for v in sorted(self.SALES_ITEMS_ALLOWED_PAGE_SIZES))
+            raise ValueError(f"tamanho_pagina must be one of: {allowed}")
+
+        response = await self.make_api_request(
+            endpoint=f"/v1/vendas/{sale_id}/itens",
+            access_token=access_token,
+            method="GET",
+            params={"pagina": pagina, "tamanho_pagina": tamanho_pagina},
+        )
+
+        items = self._extract_items(response)
+        normalized: List[Dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, dict) and "id_centro_custo" not in item:
+                normalized.append({**item, "id_centro_custo": None})
+            elif isinstance(item, dict):
+                normalized.append(item)
+        return normalized
+
+    async def get_produto_by_id(
+        self,
+        access_token: str,
+        product_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve product by id.
+
+        Preserves `url_imagem` when returned by Conta Azul.
+        """
+        response = await self.make_api_request(
+            endpoint=f"/v1/produtos/{product_id}",
+            access_token=access_token,
+            method="GET",
+        )
+
+        if isinstance(response, dict) and "url_imagem" not in response:
+            response = {**response, "url_imagem": None}
+        return response
 
     async def get_contas_pagar(
         self,

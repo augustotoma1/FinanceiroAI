@@ -871,6 +871,18 @@ class TestGetContasReceber:
             result = await service.get_contas_receber(access_token="test_token")
             assert result == mock_items
 
+    @pytest.mark.asyncio
+    async def test_get_contas_receber_with_ids_clientes_filter(self, service):
+        """Test contas a receber with ids_clientes filter."""
+        with patch.object(service, "make_api_request", new=AsyncMock(return_value=[])):
+            await service.get_contas_receber(
+                access_token="test_token",
+                ids_clientes=["cli-1", " ", "cli-2"],
+            )
+
+            call_kwargs = service.make_api_request.call_args[1]
+            assert call_kwargs["params"]["ids_clientes"] == ["cli-1", "cli-2"]
+
 
 class TestGetContasPagar:
     """Test accounts payable (contas a pagar) retrieval"""
@@ -1004,3 +1016,60 @@ class TestGetSaldoConta:
                     access_token="test_token",
                     conta_id="non-existent"
                 )
+
+
+class TestSalesAndProductUpdates:
+    """Tests for Conta Azul changelog integrations (sales items/product image/payment enum)."""
+
+    @pytest.fixture
+    def service(self):
+        return ContaAzulService()
+
+    @pytest.mark.asyncio
+    async def test_get_venda_itens_by_sale_id_success(self, service):
+        """Must accept only allowed page sizes and expose id_centro_custo."""
+        mock_items = [{"id": "i-1", "descricao": "Item A", "id_centro_custo": "cc-1"}, {"id": "i-2", "descricao": "Item B"}]
+
+        with patch.object(service, "make_api_request", new=AsyncMock(return_value={"itens": mock_items})):
+            result = await service.get_venda_itens_by_sale_id(
+                access_token="test_token",
+                sale_id="sale-123",
+                pagina=2,
+                tamanho_pagina=200,
+            )
+
+            assert len(result) == 2
+            assert result[0]["id_centro_custo"] == "cc-1"
+            assert result[1]["id_centro_custo"] is None
+            service.make_api_request.assert_called_once_with(
+                endpoint="/v1/vendas/sale-123/itens",
+                access_token="test_token",
+                method="GET",
+                params={"pagina": 2, "tamanho_pagina": 200},
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_venda_itens_by_sale_id_rejects_invalid_page_size(self, service):
+        with pytest.raises(ValueError, match="tamanho_pagina must be one of"):
+            await service.get_venda_itens_by_sale_id(
+                access_token="test_token",
+                sale_id="sale-123",
+                tamanho_pagina=30,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_produto_by_id_keeps_url_imagem(self, service):
+        with patch.object(service, "make_api_request", new=AsyncMock(return_value={"id": "p-1", "nome": "Produto"})):
+            result = await service.get_produto_by_id(
+                access_token="test_token",
+                product_id="p-1",
+            )
+
+            assert result["id"] == "p-1"
+            assert "url_imagem" in result
+            assert result["url_imagem"] is None
+
+    def test_normalize_payment_type_maps_legacy_pix_enum(self, service):
+        assert service.normalize_payment_type("PAGAMENTO_INSTANTANEO") == "PIX_PAGAMENTO_INSTANTANEO"
+        assert service.normalize_payment_type("pix") == "PIX_PAGAMENTO_INSTANTANEO"
+        assert service.normalize_payment_type("PIX_PAGAMENTO_INSTANTANEO") == "PIX_PAGAMENTO_INSTANTANEO"
